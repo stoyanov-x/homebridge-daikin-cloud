@@ -7,10 +7,10 @@
   "license": "(Apache-2.0 AND MIT)",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mp-consulting/homebridge-daikin-cloud.git"
+    "url": "git+https://github.com/stoyanov-x/homebridge-daikin-cloud.git"
   },
   "bugs": {
-    "url": "https://github.com/mp-consulting/homebridge-daikin-cloud/issues"
+    "url": "https://github.com/stoyanov-x/homebridge-daikin-cloud/issues"
   },
   "engines": {
     "node": "^20.18.0 || ^22.10.0 || ^24.0.0",
