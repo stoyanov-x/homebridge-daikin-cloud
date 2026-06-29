@@ -272,16 +272,30 @@ export class ClimateControlService {
           .updateValue(typeof heatingTemp === 'number' && isFinite(heatingTemp) ? heatingTemp : DEFAULT_ROOM_TEMPERATURE);
       }
 
-      const fanSpeedData = this.accessory.context.device.getData(
+      // Only push RotationSpeed to HomeKit when the device is in 'fixed' fan mode.
+      // When in 'auto' or 'quiet' mode, the stored `fixed` value doesn't represent
+      // the actual fan speed — it's just a fallback for when the user switches back.
+      // Pushing it would seed the HomeKit cache with a misleading value, which the
+      // home hub may then replay (as a "cache verification") when another characteristic
+      // on this service is changed — accidentally switching the device out of auto/quiet
+      // mode. The onSet guard in handleRotationSpeedSet catches the replay, but keeping
+      // the cache accurate from the start prevents the scenario entirely.
+      const fanSpeedCurrentMode = this.accessory.context.device.getData(
         this.managementPointId, 'fanControl',
-        `/operationModes/${operationMode}/fanSpeed/modes/fixed`,
+        `/operationModes/${operationMode}/fanSpeed/currentMode`,
       );
-      if (fanSpeedData.value !== undefined) {
-        const percent = deviceSpeedToPercent(fanSpeedData.value as number, fanSpeedData.maxValue);
-        this.service.getCharacteristic(this.platform.Characteristic.RotationSpeed)
-          .updateValue(percent);
-        if (this.fanService?.testCharacteristic(this.platform.Characteristic.RotationSpeed)) {
-          this.fanService.getCharacteristic(this.platform.Characteristic.RotationSpeed).updateValue(percent);
+      if (fanSpeedCurrentMode.value === DaikinFanSpeedModes.FIXED) {
+        const fanSpeedData = this.accessory.context.device.getData(
+          this.managementPointId, 'fanControl',
+          `/operationModes/${operationMode}/fanSpeed/modes/fixed`,
+        );
+        if (fanSpeedData.value !== undefined) {
+          const percent = deviceSpeedToPercent(fanSpeedData.value as number, fanSpeedData.maxValue);
+          this.service.getCharacteristic(this.platform.Characteristic.RotationSpeed)
+            .updateValue(percent);
+          if (this.fanService?.testCharacteristic(this.platform.Characteristic.RotationSpeed)) {
+            this.fanService.getCharacteristic(this.platform.Characteristic.RotationSpeed).updateValue(percent);
+          }
         }
       }
 
@@ -431,6 +445,26 @@ export class ClimateControlService {
     this.platform.log.debug(`[${this.name}] SET RotationSpeed, ${value}% → device speed ${deviceSpeed}`);
 
     const currentMode = this.accessory.context.device.getData(this.managementPointId, 'fanControl', `/operationModes/${operationMode}/fanSpeed/currentMode`);
+
+    // Guard: skip when the device is in auto or quiet fan mode and the incoming
+    // speed matches the stored fixed value. HomeKit may replay the cached
+    // RotationSpeed when another characteristic (e.g. temperature setpoint)
+    // changes on the same service. Without this guard, a simple temperature
+    // adjustment would accidentally switch the fan from auto/quiet to fixed mode
+    // at the stored speed (often 5/5).
+    if (
+      currentMode.value !== undefined &&
+      currentMode.value !== DaikinFanSpeedModes.FIXED &&
+      deviceSpeed === fixedFanSpeed.value
+    ) {
+      this.platform.log.debug(
+        `[${this.name}] SET RotationSpeed skipped — device is in "${currentMode.value}" mode ` +
+        `and speed ${deviceSpeed} already matches the stored fixed value. ` +
+        `This is likely a HomeKit cache replay, not a user fan-speed change.`,
+      );
+      return;
+    }
+
     const allowedModes = (currentMode.values ?? []) as string[];
 
     await this.setDeviceData('RotationSpeed', async () => {
