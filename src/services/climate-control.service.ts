@@ -358,7 +358,20 @@ export class ClimateControlService {
         })
         .onGet(this.handleRotationSpeedGet.bind(this))
         .onSet(this.handleRotationSpeedSet.bind(this));
-      rotationChar.updateValue(percent);
+
+      // Only seed the HomeKit cache with the stored fixed percentage when the
+      // device is actually in 'fixed' fan mode. During construction this runs
+      // before refreshValues() — without this guard, the initial seed would
+      // push a misleading value (e.g. 100% when the device is in auto mode)
+      // that the home hub may later replay as a "cache verification" write.
+      const operationMode = this.getCurrentOperationMode();
+      const currentMode = this.accessory.context.device.getData(
+        this.managementPointId, 'fanControl',
+        `/operationModes/${operationMode}/fanSpeed/currentMode`,
+      );
+      if (currentMode.value === DaikinFanSpeedModes.FIXED) {
+        rotationChar.updateValue(percent);
+      }
     } else {
       this.service.removeCharacteristic(this.service.getCharacteristic(this.platform.Characteristic.RotationSpeed));
     }
