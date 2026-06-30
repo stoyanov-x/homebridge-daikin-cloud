@@ -398,26 +398,36 @@ export class ClimateControlService {
   }
 
   async handleCurrentTemperatureGet(): Promise<CharacteristicValue> {
-    const temperature = this.accessory.context.device.getData(this.managementPointId, 'sensoryData', '/' + this.getCurrentControlMode()).value as number | undefined;
-    const lastUpdate = this.accessory.context.device.getLastUpdated();
-    this.platform.log.debug(
-      `[${this.name}] GET CurrentTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
-    );
-    // Return a valid temperature value, defaulting to 20 if undefined
-    return typeof temperature === 'number' && isFinite(temperature) ? temperature : DEFAULT_ROOM_TEMPERATURE;
+    try {
+      const temperature = this.accessory.context.device.getData(this.managementPointId, 'sensoryData', '/' + this.getCurrentControlMode()).value as number | undefined;
+      const lastUpdate = this.accessory.context.device.getLastUpdated();
+      this.platform.log.debug(
+        `[${this.name}] GET CurrentTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
+      );
+      // Return a valid temperature value, defaulting to 20 if undefined
+      return typeof temperature === 'number' && isFinite(temperature) ? temperature : DEFAULT_ROOM_TEMPERATURE;
+    } catch (e) {
+      this.platform.log.warn(`[${this.name}] GET CurrentTemperature failed: ${e instanceof Error ? e.message : e}`);
+      return DEFAULT_ROOM_TEMPERATURE;
+    }
   }
 
   async handleCoolingThresholdTemperatureGet(): Promise<CharacteristicValue> {
-    const setpoint = this.getSetpoint(DaikinOperationModes.COOLING);
-    const path = `/operationModes/${DaikinOperationModes.COOLING}/setpoints/${setpoint}`;
-    const temperature = this.accessory.context.device.getData(
-      this.managementPointId, 'temperatureControl', path,
-    ).value as number | undefined;
-    const lastUpdate = this.accessory.context.device.getLastUpdated();
-    this.platform.log.debug(
-      `[${this.name}] GET CoolingThresholdTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
-    );
-    return typeof temperature === 'number' && isFinite(temperature) ? temperature : 25;
+    try {
+      const setpoint = this.getSetpoint(DaikinOperationModes.COOLING);
+      const path = `/operationModes/${DaikinOperationModes.COOLING}/setpoints/${setpoint}`;
+      const temperature = this.accessory.context.device.getData(
+        this.managementPointId, 'temperatureControl', path,
+      ).value as number | undefined;
+      const lastUpdate = this.accessory.context.device.getLastUpdated();
+      this.platform.log.debug(
+        `[${this.name}] GET CoolingThresholdTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
+      );
+      return typeof temperature === 'number' && isFinite(temperature) ? temperature : 25;
+    } catch (e) {
+      this.platform.log.warn(`[${this.name}] GET CoolingThresholdTemperature failed: ${e instanceof Error ? e.message : e}`);
+      return 25;
+    }
   }
 
   async handleCoolingThresholdTemperatureSet(value: CharacteristicValue) {
@@ -497,16 +507,21 @@ export class ClimateControlService {
   }
 
   async handleHeatingThresholdTemperatureGet(): Promise<CharacteristicValue> {
-    const setpoint = this.getSetpoint(DaikinOperationModes.HEATING);
-    const path = `/operationModes/${DaikinOperationModes.HEATING}/setpoints/${setpoint}`;
-    const temperature = this.accessory.context.device.getData(
-      this.managementPointId, 'temperatureControl', path,
-    ).value as number | undefined;
-    const lastUpdate = this.accessory.context.device.getLastUpdated();
-    this.platform.log.debug(
-      `[${this.name}] GET HeatingThresholdTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
-    );
-    return typeof temperature === 'number' && isFinite(temperature) ? temperature : DEFAULT_ROOM_TEMPERATURE;
+    try {
+      const setpoint = this.getSetpoint(DaikinOperationModes.HEATING);
+      const path = `/operationModes/${DaikinOperationModes.HEATING}/setpoints/${setpoint}`;
+      const temperature = this.accessory.context.device.getData(
+        this.managementPointId, 'temperatureControl', path,
+      ).value as number | undefined;
+      const lastUpdate = this.accessory.context.device.getLastUpdated();
+      this.platform.log.debug(
+        `[${this.name}] GET HeatingThresholdTemperature, temperature: ${temperature}, last update: ${lastUpdate}`,
+      );
+      return typeof temperature === 'number' && isFinite(temperature) ? temperature : DEFAULT_ROOM_TEMPERATURE;
+    } catch (e) {
+      this.platform.log.warn(`[${this.name}] GET HeatingThresholdTemperature failed: ${e instanceof Error ? e.message : e}`);
+      return DEFAULT_ROOM_TEMPERATURE;
+    }
   }
 
   async handleHeatingThresholdTemperatureSet(value: CharacteristicValue) {
@@ -728,11 +743,17 @@ export class ClimateControlService {
           }
       }
 
-
-      throw new Error(
-        `Could not determine the TemperatureControlSetpoint for operationMode: ${operationMode}, `
-        + `setpointMode: ${setpointMode}, controlMode: ${controlMode}, deviceId: ${this.accessory.UUID}`,
+      // No matched combination — log a warning and fall back to roomTemperature
+      // instead of throwing. Throwing here propagates through onGet handlers and
+      // causes HomeKit to mark the accessory as "not responding", even though the
+      // device is operational — the mismatch is just an unhandled combination of
+      // setpointMode × controlMode × operationMode (e.g. Altherma in auto mode).
+      this.platform.log.warn(
+        `[${this.name}] Unhandled setpoint combination — ` +
+        `operationMode=${operationMode}, setpointMode=${setpointMode}, ` +
+        `controlMode=${controlMode}. Falling back to roomTemperature.`,
       );
+      return DaikinTemperatureControlSetpoints.ROOM_TEMPERATURE;
     }
 
     switch (controlMode) {

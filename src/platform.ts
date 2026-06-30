@@ -16,6 +16,7 @@ import {
   ONE_MINUTE_MS,
   DEFAULT_UPDATE_INTERVAL_MINUTES,
   DEFAULT_FORCE_UPDATE_DELAY_MS,
+  WEBSOCKET_FALLBACK_POLL_INTERVAL_MS,
   RATE_LIMIT_WARNING_THRESHOLD,
 } from './constants';
 
@@ -39,6 +40,7 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   private readonly updateMapper: UpdateMapper;
   private readonly authMode: 'developer_portal' | 'mobile_app';
   private readonly deviceListeners = new Map<string, () => void>();
+  private websocketConnected = false;
 
   constructor(
         public readonly log: Logger,
@@ -165,14 +167,23 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
       // WebSocket event handlers
       this.controller.on('websocket_connected', () => {
+        this.websocketConnected = true;
         this.log.info('[WebSocket] Connected - receiving real-time updates');
+        // Restore the normal polling interval now that real-time updates are flowing
+        this.restartUpdateDevicesInterval();
       });
 
       this.controller.on('websocket_disconnected', (info?: { reconnecting: boolean }) => {
+        this.websocketConnected = false;
         if (info?.reconnecting) {
           this.log.debug('[WebSocket] Disconnected, attempting to reconnect...');
+          // Shorten the polling interval while WebSocket is down so the plugin
+          // doesn't miss state changes for the full configured interval (default
+          // 15 min). Once WebSocket reconnects, websocket_connected restores it.
+          this.restartUpdateDevicesInterval(WEBSOCKET_FALLBACK_POLL_INTERVAL_MS);
         } else {
           this.log.info('[WebSocket] Disconnected');
+          this.restartUpdateDevicesInterval(WEBSOCKET_FALLBACK_POLL_INTERVAL_MS);
         }
       });
 
@@ -337,15 +348,25 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     }, delay);
   }
 
-  private startUpdateDevicesInterval() {
-    this.log.debug(`[API Syncing] (Re)starting update devices interval every ${this.updateIntervalDelay / ONE_MINUTE_MS} minutes`);
+  private startUpdateDevicesInterval(intervalMs?: number) {
+    const delay = intervalMs ?? this.updateIntervalDelay;
+    this.log.debug(`[API Syncing] (Re)starting update devices interval every ${delay / ONE_MINUTE_MS} minutes`);
     this.updateInterval = setInterval(async () => {
       try {
         await this.updateDevices();
       } catch (error) {
         this.log.error(`[API Syncing] Periodic update failed: ${(error as Error).message}`);
       }
-    }, this.updateIntervalDelay);
+    }, delay);
+  }
+
+  /**
+   * Restart the periodic polling interval, optionally with a custom delay.
+   * Clears the existing interval before starting a new one.
+   */
+  private restartUpdateDevicesInterval(intervalMs?: number): void {
+    clearInterval(this.updateInterval);
+    this.startUpdateDevicesInterval(intervalMs);
   }
 
   private async enableWebSocket() {

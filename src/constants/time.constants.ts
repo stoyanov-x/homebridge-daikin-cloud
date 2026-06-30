@@ -17,3 +17,10 @@ export const DEFAULT_UPDATE_INTERVAL_MINUTES = 15;
 
 /** Default delay before force update in milliseconds */
 export const DEFAULT_FORCE_UPDATE_DELAY_MS = ONE_SECOND_MS * 60;
+
+/**
+ * Fallback polling interval (ms) used when WebSocket is disconnected.
+ * Shorter than the normal interval so the plugin catches state changes
+ * quickly when real-time updates aren't available.
+ */
+export const WEBSOCKET_FALLBACK_POLL_INTERVAL_MS = ONE_MINUTE_MS * 2;
