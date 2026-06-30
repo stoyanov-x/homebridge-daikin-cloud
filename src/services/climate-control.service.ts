@@ -481,9 +481,9 @@ export class ClimateControlService {
       deviceSpeed === fixedFanSpeed.value
     ) {
       this.platform.log.debug(
-        `[${this.name}] SET RotationSpeed skipped — device is in "${currentMode.value}" mode ` +
+        `[${this.name}] SET RotationSpeed skipped — device is in '${currentMode.value}' mode ` +
         `and speed ${deviceSpeed} already matches the stored fixed value. ` +
-        `This is likely a HomeKit cache replay, not a user fan-speed change.`,
+        'This is likely a HomeKit cache replay, not a user fan-speed change.',
       );
       return;
     }
