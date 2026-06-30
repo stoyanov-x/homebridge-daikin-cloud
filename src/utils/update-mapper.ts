@@ -72,6 +72,10 @@ export class UpdateMapper {
         this.handleTemperatureControlUpdate(service, update, result);
         break;
 
+      case 'fanControl':
+        this.handleFanControlUpdate(service, update, result);
+        break;
+
       default:
         // No fast-path mapping — refreshValues (driven by the same 'updated'
         // event) will pick this up from in-memory state on the next refresh.
@@ -224,6 +228,83 @@ export class UpdateMapper {
     if (coolingTemp !== undefined) {
       service.updateCharacteristic(this.characteristicClass.CoolingThresholdTemperature, coolingTemp);
       result.updated.push(`CoolingThresholdTemperature=${coolingTemp}`);
+    }
+  }
+
+  /**
+     * Handle fanControl updates — RotationSpeed and/or SwingMode fast-path.
+     *
+     * Daikin sends partial sub-trees (e.g. just the fixed fan speed for the
+     * current operation mode). This handler extracts usable values and updates
+     * the corresponding HAP characteristics immediately, without waiting for
+     * the full refreshValues() pass.
+     *
+     * The data structure is deeply nested and operation-mode dependent, so
+     * this is best-effort — any values that can't be mapped are left for
+     * refreshValues() to pick up from the in-memory device state.
+     */
+  private handleFanControlUpdate(
+    service: Service,
+    update: DeviceUpdate,
+    result: UpdateResult,
+  ): void {
+    const value = update.data.value as Record<string, unknown> | undefined;
+    if (!value || typeof value !== 'object') {
+      return;
+    }
+
+    // Navigate to operationModes — the WebSocket push may wrap it in a value object
+    const operationModes =
+      (value as { operationModes?: Record<string, unknown> }).operationModes ??
+      ((value as { value?: { operationModes?: Record<string, unknown> } }).value
+        ?.operationModes);
+
+    if (!operationModes) {
+      return;
+    }
+
+    // Iterate over operation modes to find fanSpeed or fanDirection data
+    for (const modeKey of Object.keys(operationModes)) {
+      const modeData = operationModes[modeKey] as Record<string, unknown> | undefined;
+      if (!modeData || typeof modeData !== 'object') {
+        continue;
+      }
+
+      // fanSpeed updates
+      const fanSpeed = modeData.fanSpeed as Record<string, unknown> | undefined;
+      if (fanSpeed) {
+        // If the fixed speed changed, push to RotationSpeed
+        const modes = fanSpeed.modes as Record<string, unknown> | undefined;
+        const fixedMode = modes?.fixed as { value?: number } | undefined;
+        if (fixedMode?.value !== undefined) {
+          service.updateCharacteristic(
+            this.characteristicClass.RotationSpeed,
+            fixedMode.value,
+          );
+          result.updated.push(`RotationSpeed=${fixedMode.value}`);
+        }
+      }
+
+      // fanDirection updates (swing / oscillation)
+      const fanDirection = modeData.fanDirection as Record<string, unknown> | undefined;
+      if (fanDirection) {
+        const vertical = fanDirection.vertical as { currentMode?: { value?: string } } | undefined;
+        const horizontal = fanDirection.horizontal as { currentMode?: { value?: string } } | undefined;
+
+        if (vertical?.currentMode?.value !== undefined || horizontal?.currentMode?.value !== undefined) {
+          const vStop = vertical?.currentMode?.value === 'stop';
+          const hStop = horizontal?.currentMode?.value === 'stop';
+          const swingEnabled = !hStop && !vStop;
+
+          service.updateCharacteristic(
+            this.characteristicClass.SwingMode,
+            swingEnabled
+              ? this.characteristicClass.SwingMode.SWING_ENABLED
+              : this.characteristicClass.SwingMode.SWING_DISABLED,
+          );
+          result.updated.push(`SwingMode=${swingEnabled ? 'SWING_ENABLED' : 'SWING_DISABLED'}`);
+        }
+      }
     }
   }
 
