@@ -615,8 +615,16 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     // Use the UpdateMapper to apply the update
     const result = this.updateMapper.applyUpdate(accessory, update);
 
-    if (result.success) {
-      this.log.debug(`[WebSocket] Updated ${result.updated.join(', ')}`);
+    if (!result.success || result.updated.length === 0) {
+      return;
     }
+
+    // At info level: otherwise a push that reaches HomeKit is indistinguishable
+    // from one that never arrived, because the only other trace is debug output.
+    // Only emitted when a characteristic actually changed, so repeated frames for
+    // the same value stay quiet.
+    const value = update.data?.value;
+    const shown = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    this.log.info(`[WebSocket] ${accessory.displayName}: ${update.characteristicName} -> ${shown} (${result.updated.join(', ')})`);
   }
 }

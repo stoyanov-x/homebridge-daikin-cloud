@@ -19,6 +19,18 @@ import { cachedLookup } from './dns-cache';
 /** Refresh this many seconds before the access token expires (and treat it as expired inside this window) */
 const TOKEN_REFRESH_BUFFER_SECONDS = 60;
 
+/**
+ * Proactive refresh timers, kept off the instance on purpose.
+ *
+ * The accessory context holds the device, which holds the api client, which
+ * holds this object - and Homebridge serialises platform accessories to
+ * cachedAccessories on every change. A Node Timeout carries _idlePrev/_idleNext
+ * links, so an enumerable timer property makes that JSON circular and Homebridge
+ * refuses to save the cache at all ("accessories will not persist between
+ * restarts").
+ */
+const refreshTimers = new WeakMap<object, NodeJS.Timeout>();
+
 interface PKCEPair {
     verifier: string;
     challenge: string;
@@ -38,7 +50,6 @@ interface GigyaLoginResult {
 
 export class DaikinMobileOAuth {
   private tokenSet: TokenSet | null = null;
-  private refreshTimer: NodeJS.Timeout | null = null;
   private refreshPromise: Promise<TokenSet> | null = null;
   private cookies = '';
 
@@ -164,10 +175,7 @@ export class DaikinMobileOAuth {
    * process alive.
    */
   private scheduleProactiveRefresh(tokenSet: TokenSet): void {
-    if (this.refreshTimer) {
-      clearTimeout(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    this.clearRefreshTimer();
 
     if (!tokenSet.refresh_token) {
       return;
@@ -182,8 +190,8 @@ export class DaikinMobileOAuth {
       : (tokenSet.expires_in || 0);
 
     const delayMs = Math.max(0, remainingSeconds - TOKEN_REFRESH_BUFFER_SECONDS) * 1000;
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = null;
+    const timer = setTimeout(() => {
+      refreshTimers.delete(this);
       this.onLog?.(`[Auth] Refreshing access token ${TOKEN_REFRESH_BUFFER_SECONDS}s before it expires`);
       this.refreshToken().catch((error: Error) => {
         // Not fatal: getAccessToken still refreshes on demand, and the platform
@@ -191,7 +199,16 @@ export class DaikinMobileOAuth {
         this.onLog?.(`[Auth] Proactive refresh failed: ${error.message}`);
       });
     }, delayMs);
-    this.refreshTimer.unref?.();
+    timer.unref?.();
+    refreshTimers.set(this, timer);
+  }
+
+  private clearRefreshTimer(): void {
+    const timer = refreshTimers.get(this);
+    if (timer) {
+      clearTimeout(timer);
+      refreshTimers.delete(this);
+    }
   }
 
   /**
@@ -222,10 +239,7 @@ export class DaikinMobileOAuth {
      * Clear stored tokens
      */
   clearTokens(): void {
-    if (this.refreshTimer) {
-      clearTimeout(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    this.clearRefreshTimer();
     this.deleteFile();
     this.tokenSet = null;
   }

@@ -452,3 +452,24 @@ describe('refresh scheduling for a token restored from disk', () => {
     vi.useRealTimers();
   });
 });
+
+describe('serialisation safety', () => {
+  // Homebridge writes platform accessories to cachedAccessories on every change,
+  // and the accessory context reaches this object via device -> api -> oauth.
+  // An enumerable Node Timeout there threw "Converting circular structure to JSON"
+  // and stopped the cache from being written at all.
+  it('stays JSON-serialisable while a refresh timer is armed', () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'access',
+      refresh_token: 'refresh',
+      expires_in: 3600,
+    });
+
+    const accessory = { context: { device: { getApi: () => ({ oauth }) } } };
+    expect(() => JSON.stringify(accessory)).not.toThrow();
+
+    vi.useRealTimers();
+  });
+});
