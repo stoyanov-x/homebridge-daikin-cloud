@@ -410,3 +410,45 @@ describe('proactive token refresh', () => {
     vi.useRealTimers();
   });
 });
+
+describe('refresh scheduling for a token restored from disk', () => {
+  it('refreshes relative to expires_at, not a fresh lifetime', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-30T09:00:00Z'));
+    const { loadTokenFromFile } = await import('../../../src/api/token-storage');
+    (loadTokenFromFile as unknown as { mockReturnValue: (v: unknown) => void }).mockReturnValue({
+      access_token: 'from-disk',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 1800, // half its life already gone
+    });
+
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    await vi.advanceTimersByTimeAsync(1700 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(40 * 1000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
+  it('refreshes immediately when the restored token is already inside the buffer', async () => {
+    vi.useFakeTimers();
+    const { loadTokenFromFile } = await import('../../../src/api/token-storage');
+    (loadTokenFromFile as unknown as { mockReturnValue: (v: unknown) => void }).mockReturnValue({
+      access_token: 'from-disk',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 20,
+    });
+
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+});

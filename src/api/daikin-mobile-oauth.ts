@@ -169,12 +169,19 @@ export class DaikinMobileOAuth {
       this.refreshTimer = null;
     }
 
-    const lifetimeSeconds = tokenSet.expires_in || (tokenSet.expires_at ? tokenSet.expires_at - Math.floor(Date.now() / 1000) : 0);
-    if (!tokenSet.refresh_token || lifetimeSeconds <= TOKEN_REFRESH_BUFFER_SECONDS * 2) {
+    if (!tokenSet.refresh_token) {
       return;
     }
 
-    const delayMs = (lifetimeSeconds - TOKEN_REFRESH_BUFFER_SECONDS) * 1000;
+    // Measure from expires_at, not expires_in: a token loaded from disk at
+    // startup was issued at some earlier point, and expires_in alone would
+    // schedule the refresh after it has already expired.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const remainingSeconds = tokenSet.expires_at
+      ? tokenSet.expires_at - nowSeconds
+      : (tokenSet.expires_in || 0);
+
+    const delayMs = Math.max(0, remainingSeconds - TOKEN_REFRESH_BUFFER_SECONDS) * 1000;
     this.refreshTimer = setTimeout(() => {
       this.refreshTimer = null;
       this.onLog?.(`[Auth] Refreshing access token ${TOKEN_REFRESH_BUFFER_SECONDS}s before it expires`);
@@ -535,6 +542,12 @@ export class DaikinMobileOAuth {
   private loadFromFile(): void {
     try {
       this.tokenSet = loadTokenFromFile(this.config.tokenFilePath);
+      // A token restored at startup is just as real as one we fetched, and it is
+      // the common case after a restart: without this the proactive refresh would
+      // only ever be armed by a login that happened in this process.
+      if (this.tokenSet?.access_token) {
+        this.scheduleProactiveRefresh(this.tokenSet);
+      }
     } catch (error) {
       if (this.onError) {
         this.onError(new Error('Failed to load token file: ' + (error as Error).message));
