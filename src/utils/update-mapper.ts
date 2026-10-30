@@ -107,13 +107,31 @@ export class UpdateMapper {
       );
       result.updated.push(`Active=${isOn ? 'ACTIVE' : 'INACTIVE'}`);
 
-      // Also update CurrentHeaterCoolerState
       if (!isOn) {
+        // Also update CurrentHeaterCoolerState
         service.updateCharacteristic(
           this.characteristicClass.CurrentHeaterCoolerState,
           this.characteristicClass.CurrentHeaterCoolerState.INACTIVE,
         );
         result.updated.push('CurrentHeaterCoolerState=INACTIVE');
+      } else {
+        // Powering on only pushes onOffMode, so the current/target state has to be
+        // derived here. Setting just Active left the tile showing the previous
+        // (idle/off) state until something else refreshed it.
+        const operationMode = accessory.context.device.getData(
+          update.embeddedId,
+          'operationMode',
+          undefined,
+        ).value as string;
+        const mapping = this.mapOperationModeToHeaterCooler(operationMode);
+        if (mapping) {
+          service.updateCharacteristic(this.characteristicClass.TargetHeaterCoolerState, mapping.target);
+          service.updateCharacteristic(this.characteristicClass.CurrentHeaterCoolerState, mapping.current);
+          result.updated.push(
+            `TargetHeaterCoolerState=${mapping.target}`,
+            `CurrentHeaterCoolerState=${mapping.current}`,
+          );
+        }
       }
     } else {
       // Thermostat uses CurrentHeatingCoolingState
