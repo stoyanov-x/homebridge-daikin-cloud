@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { RateLimitStatus, GatewayDevice, OAuthProvider } from './daikin-types';
 import { DAIKIN_OIDC_CONFIG } from './daikin-types';
 import { GatewayDeviceSchema } from './daikin-schemas';
+import { cachedLookup } from './dns-cache';
 import {
   HTTP_STATUS,
   DEFAULT_RETRY_AFTER_SECONDS,
@@ -51,6 +52,10 @@ function describeEndpoint(urlObj: URL): string {
 }
 
 function describeError(error: Error, urlObj: URL): Error {
+  // The timeout handler already named the endpoint; don't name it twice.
+  if (error.message.includes(describeEndpoint(urlObj))) {
+    return error;
+  }
   return new Error(`${error.message} (${describeEndpoint(urlObj)})`);
 }
 
@@ -123,8 +128,9 @@ export class DaikinApi {
       const options: https.RequestOptions = {
         hostname: urlObj.hostname,
         port: 443,
-        path: urlObj.pathname + urlObj.search,
+        path: urlObj.pathname,
         method: 'GET',
+        lookup: cachedLookup,
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Accept': 'application/json',
@@ -411,6 +417,7 @@ export class DaikinApi {
         port: 443,
         path: urlObj.pathname + urlObj.search,
         method,
+        lookup: cachedLookup,
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Accept': 'application/json',

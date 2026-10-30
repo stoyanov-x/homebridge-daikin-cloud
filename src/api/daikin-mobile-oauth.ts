@@ -14,6 +14,7 @@ import type { TokenSet, MobileClientConfig } from './daikin-types';
 import { DAIKIN_MOBILE_CONFIG } from './daikin-types';
 import { HTTP_REQUEST_TIMEOUT_MS } from '../constants';
 import { loadTokenFromFile, saveTokenToFile, deleteTokenFile } from './token-storage';
+import { cachedLookup } from './dns-cache';
 
 /** Refresh this many seconds before the access token expires (and treat it as expired inside this window) */
 const TOKEN_REFRESH_BUFFER_SECONDS = 60;
@@ -573,6 +574,7 @@ export class DaikinMobileOAuth {
         port: 443,
         path: urlObj.pathname + urlObj.search,
         method: options.method,
+        lookup: cachedLookup,
         headers: {
           ...options.headers,
           ...(postData ? { 'Content-Length': Buffer.byteLength(postData).toString() } : {}),
