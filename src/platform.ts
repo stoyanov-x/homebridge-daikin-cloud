@@ -8,12 +8,13 @@ import { StringUtils } from './utils/strings';
 
 import fs from 'node:fs';
 import type { DaikinCloudDevice, DaikinControllerConfig } from './api';
-import { DaikinCloudRepo, DaikinCloudController } from './api';
+import { DaikinCloudRepo, DaikinCloudController, DAIKIN_MOBILE_CONFIG, DAIKIN_OIDC_CONFIG } from './api';
 import { UpdateMapper } from './utils/update-mapper';
 import type { PluginConfig } from './config/config-manager';
 import { ConfigManager } from './config/config-manager';
 import {
   ONE_MINUTE_MS,
+  ONE_HOUR_MS,
   DEFAULT_UPDATE_INTERVAL_MINUTES,
   DEFAULT_FORCE_UPDATE_DELAY_MS,
   WEBSOCKET_FALLBACK_POLL_INTERVAL_MS,
@@ -21,6 +22,20 @@ import {
   DISCOVERY_RETRY_MAX_DELAY_MS,
   RATE_LIMIT_WARNING_THRESHOLD,
 } from './constants';
+
+/** "9h 12m" — for staleness messages, where an exact millisecond count is noise. */
+function formatDuration(ms: number): string {
+  const minutes = Math.floor(ms / ONE_MINUTE_MS);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) {
+    return `${days}d ${hours % 24}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  return `${minutes}m`;
+}
 
 export type DaikinCloudAccessoryContext = {
     device: DaikinCloudDevice;
@@ -40,6 +55,10 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   private forceUpdateTimeout: NodeJS.Timeout | undefined;
   private discoveryRetryTimeout: NodeJS.Timeout | undefined;
   private discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+  private discoveryAttempts = 0;
+  private lastSuccessfulUpdateAt: Date | undefined;
+  private stalenessMonitor: NodeJS.Timeout | undefined;
+  private stalenessWarnedAt = 0;
   private isShuttingDown = false;
   private readonly accessoryFactory: AccessoryFactory;
   private readonly updateMapper: UpdateMapper;
@@ -126,6 +145,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
     this.controller = new DaikinCloudController(daikinCloudControllerConfig);
 
+    // Spelled out because the first thing worth checking in an outage is whether
+    // the endpoints the plugin uses answer at all.
+    const apiBaseUrl = this.authMode === 'mobile_app' ? DAIKIN_MOBILE_CONFIG.apiBaseUrl : DAIKIN_OIDC_CONFIG.apiBaseUrl;
+    const websocketUrl = this.authMode === 'mobile_app' ? DAIKIN_MOBILE_CONFIG.websocketUrl : undefined;
+    this.log.info(`[Config] Daikin Cloud API: ${apiBaseUrl}${websocketUrl ? ` (WebSocket: ${websocketUrl})` : ''}`);
+
     this.api.on('didFinishLaunching', async () => {
       if (!this.controller) {
         return;
@@ -208,6 +233,8 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       this.log.debug('[Platform] Shutting down, cleaning up resources...');
       this.isShuttingDown = true;
       clearInterval(this.updateInterval);
+      clearInterval(this.stalenessMonitor);
+      this.stalenessMonitor = undefined;
       clearTimeout(this.forceUpdateTimeout);
       clearTimeout(this.discoveryRetryTimeout);
       this.controller?.disableWebSocket();
@@ -256,7 +283,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     const devices: DaikinCloudDevice[] = await this.discoverDevices(controller, onInvalidGrantError);
 
     if (devices.length > 0) {
+      if (this.discoveryAttempts > 0) {
+        this.log.info(`[API Syncing] Device discovery recovered after ${this.discoveryAttempts} failed attempt(s)`);
+        this.discoveryAttempts = 0;
+      }
       this.discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+      this.lastSuccessfulUpdateAt = new Date();
       this.createDevices(devices);
       this.startUpdateDevicesInterval();
 
@@ -269,6 +301,13 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
     if (this.isShuttingDown || this.discoveryRetryTimeout) {
       return;
+    }
+
+    this.discoveryAttempts++;
+    if (this.discoveryAttempts === 1) {
+      // Say what the user will see, not just that a call failed: the accessories
+      // stay published with the characteristic values from the last shutdown.
+      this.log.warn('[API Syncing] No devices discovered: HomeKit will keep showing the state cached at the last shutdown until discovery succeeds');
     }
 
     const delay = this.discoveryRetryDelay;
@@ -353,10 +392,51 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     }
     try {
       await this.controller.updateAllDeviceData();
+      this.lastSuccessfulUpdateAt = new Date();
+      this.stalenessWarnedAt = 0;
     } catch (error) {
       // JSON.stringify(error) is just "{}" - an Error carries nothing enumerable.
       this.log.error(`[API Syncing] Failed to update devices data: ${(error as Error).message}`);
     }
+  }
+
+  /**
+   * Warn when HomeKit's view of the devices has gone stale.
+   *
+   * A cloud outage otherwise looks like a working plugin showing the wrong
+   * values: nothing throws on the HomeKit side, requests just keep failing. The
+   * warning repeats once an hour so it survives a log being cleared.
+   */
+  private startStalenessMonitor(): void {
+    if (this.stalenessMonitor) {
+      return;
+    }
+
+    const staleAfterMs = Math.max(this.updateIntervalDelay * 3, 15 * ONE_MINUTE_MS);
+    const checkEveryMs = Math.min(this.updateIntervalDelay, 5 * ONE_MINUTE_MS);
+
+    this.stalenessMonitor = setInterval(() => {
+      const lastSuccess = this.lastSuccessfulUpdateAt;
+      if (this.isShuttingDown || !lastSuccess) {
+        return;
+      }
+
+      const staleForMs = Date.now() - lastSuccess.getTime();
+      if (staleForMs < staleAfterMs) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - this.stalenessWarnedAt < ONE_HOUR_MS) {
+        return;
+      }
+
+      this.stalenessWarnedAt = now;
+      this.log.warn(
+        `[API Syncing] No successful update for ${formatDuration(staleForMs)}: `
+        + `HomeKit is still showing the state from ${lastSuccess.toISOString()}`,
+      );
+    }, checkEveryMs);
   }
 
   forceUpdateDevices(delay: number = Math.max(0, this.config.forceUpdateDelay || DEFAULT_FORCE_UPDATE_DELAY_MS)) {
@@ -388,6 +468,7 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   private startUpdateDevicesInterval(intervalMs?: number) {
     const delay = intervalMs ?? this.updateIntervalDelay;
     this.log.debug(`[API Syncing] (Re)starting update devices interval every ${delay / ONE_MINUTE_MS} minutes`);
+    this.startStalenessMonitor();
     this.updateInterval = setInterval(async () => {
       try {
         await this.updateDevices();

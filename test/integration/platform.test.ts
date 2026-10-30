@@ -291,12 +291,15 @@ test('retries device discovery after a failed boot instead of staying inert', as
   const api = new HomebridgeAPI();
   const registerPlatformAccessoriesSpy = vi.spyOn(api, 'registerPlatformAccessories');
 
-  new DaikinCloudPlatform(new Logger(), new MockPlatformConfig(true), api);
+  const platform = new DaikinCloudPlatform(new Logger(), new MockPlatformConfig(true), api);
+  const warnSpy = vi.spyOn(platform.log, 'warn');
   api.signalFinished();
   await vi.advanceTimersByTimeAsync(100);
 
   expect(getCloudDevices).toHaveBeenCalledTimes(1);
   expect(registerPlatformAccessoriesSpy).not.toHaveBeenCalled();
+  // The log has to say what the user will see, not just that a call failed
+  expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('cached at the last shutdown'));
 
   // The retry fires a minute later and the accessories get registered
   await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS);
@@ -343,4 +346,55 @@ test('backs off until the discovery retry delay is capped', async () => {
   api.signalShutdown();
   await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 60);
   expect(getCloudDevices).toHaveBeenCalledTimes(6);
+});
+
+test('warns hourly when polls keep failing and HomeKit is showing stale state', async () => {
+  const mockDevice = {
+    getId: () => 'MOCK_ID',
+    getDescription: () => ({ deviceModel: 'Airco' }),
+    getData: () => 'MOCK_DATE',
+    desc: { managementPoints: [{ embeddedId: 'climateControl', managementPointType: 'climateControl' }] },
+  } as unknown as DaikinCloudDevice;
+
+  const updateAllDeviceData = vi.fn().mockResolvedValue(undefined);
+
+  MockDaikinCloudController.mockImplementation(function(this: any) {
+    this.getCloudDevices = vi.fn().mockResolvedValue([mockDevice]);
+    this.isAuthenticated = vi.fn().mockReturnValue(true);
+    this.on = vi.fn();
+    this.updateAllDeviceData = updateAllDeviceData;
+    this.disableWebSocket = vi.fn();
+  });
+
+  const api = new HomebridgeAPI();
+  const platform = new DaikinCloudPlatform(new Logger(), new MockPlatformConfig(true), api);
+  const warnSpy = vi.spyOn(platform.log, 'warn');
+  api.signalFinished();
+  await vi.advanceTimersByTimeAsync(100);
+
+  expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('No successful update'));
+
+  // The cloud goes away: polls fail, nothing throws on the HomeKit side
+  updateAllDeviceData.mockRejectedValue(new Error('Request timed out after 30000ms (api.onecta.daikineurope.com)'));
+
+  // Stale after 3x the 15 minute interval, checked every 5 minutes
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 50);
+  const staleWarnings = () => warnSpy.mock.calls.filter(([message]) => String(message).includes('No successful update'));
+  expect(staleWarnings()).toHaveLength(1);
+  expect(String(staleWarnings()[0][0])).toContain('HomeKit is still showing the state from');
+
+  // Not repeated every check - an hourly reminder, not a flood
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 30);
+  expect(staleWarnings()).toHaveLength(1);
+
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 30);
+  expect(staleWarnings()).toHaveLength(2);
+
+  // A successful poll clears it
+  updateAllDeviceData.mockResolvedValue(undefined);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 16);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 60);
+  expect(staleWarnings()).toHaveLength(2);
+
+  api.signalShutdown();
 });
