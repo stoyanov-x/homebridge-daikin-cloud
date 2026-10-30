@@ -156,7 +156,28 @@ export type DaikinEventType =
     | 'error'
     | 'websocket_connected'
     | 'websocket_disconnected'
-    | 'websocket_device_update';
+    | 'websocket_device_update'
+    | 'websocket_group_update';
+
+// WebSocket Group Update Event Data
+//
+// Sent for grouped equipment (a group spans devices, so there is no single
+// device id to apply it to).
+export interface WebSocketGroupUpdate {
+    groupId: string;
+    siteId: string;
+    characteristicName: string;
+    data: {
+        name: string;
+        settable?: boolean;
+        value: unknown;
+        values?: string[];
+        ref?: string;
+        minValue?: number;
+        maxValue?: number;
+        stepValue?: number;
+    };
+}
 
 // WebSocket Device Update Event Data
 export interface WebSocketDeviceUpdate {

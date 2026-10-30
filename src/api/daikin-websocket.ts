@@ -219,7 +219,7 @@ export class DaikinWebSocket extends EventEmitter {
         });
       }
 
-      // Handle group characteristic updates (alternative event format)
+      // Handle group characteristic updates (grouped equipment)
       if (message.event === 'group:characteristic') {
         const event = message as GroupCharacteristicEvent;
         this.emit('group_update', {

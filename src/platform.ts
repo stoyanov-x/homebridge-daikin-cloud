@@ -222,6 +222,14 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
         this.handleWebSocketDeviceUpdate(update);
       });
 
+      // Group events cannot be mapped to a single accessory (no group-to-device
+      // map is fetched), so use them as a hint that something changed and let the
+      // debounced force-update reconcile. Cheap: rapid bursts collapse into one poll.
+      this.controller.on('websocket_group_update', (update) => {
+        this.log.debug(`[WebSocket] Group update: ${update.groupId} - ${update.characteristicName} (refreshing devices)`);
+        this.forceUpdateDevices();
+      });
+
       const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
       await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
 
