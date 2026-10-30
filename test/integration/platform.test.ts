@@ -400,3 +400,42 @@ test('warns hourly when polls keep failing and HomeKit is showing stale state', 
 
   api.signalShutdown();
 });
+
+test('logs in again when the stored token set is rejected, instead of retrying it', async () => {
+  const mockDevice = {
+    getId: () => 'MOCK_ID',
+    getDescription: () => ({ deviceModel: 'Airco' }),
+    getData: () => 'MOCK_DATE',
+    desc: { managementPoints: [{ embeddedId: 'climateControl', managementPointType: 'climateControl' }] },
+  } as unknown as DaikinCloudDevice;
+
+  // Exactly what a rotated/revoked refresh token looks like at startup
+  const getCloudDevices = vi.fn()
+    .mockRejectedValueOnce(new Error('Token refresh failed: The provided authorization code or refresh token is invalid.'))
+    .mockResolvedValue([mockDevice]);
+  const authenticateMobile = vi.fn().mockResolvedValue({ access_token: 'new' });
+
+  MockDaikinCloudController.mockImplementation(function(this: any) {
+    this.getCloudDevices = getCloudDevices;
+    this.isAuthenticated = vi.fn().mockReturnValue(true);
+    this.on = vi.fn();
+    this.updateAllDeviceData = vi.fn().mockResolvedValue(undefined);
+    this.authenticateMobile = authenticateMobile;
+    this.disableWebSocket = vi.fn();
+  });
+
+  const api = new HomebridgeAPI();
+  const config = new MockPlatformConfig(true);
+  (config as any).authMode = 'mobile_app';
+  (config as any).daikinEmail = 'user@example.com';
+  (config as any).daikinPassword = 'secret';
+  const registerPlatformAccessoriesSpy = vi.spyOn(api, 'registerPlatformAccessories');
+
+  new DaikinCloudPlatform(new Logger(), config, api);
+  api.signalFinished();
+  await vi.advanceTimersByTimeAsync(1000);
+
+  expect(authenticateMobile).toHaveBeenCalledTimes(1);
+  expect(getCloudDevices).toHaveBeenCalledTimes(2);
+  expect(registerPlatformAccessoriesSpy).toHaveBeenCalledWith('@mp-consulting/homebridge-daikin-cloud', 'DaikinCloud', expect.anything());
+});

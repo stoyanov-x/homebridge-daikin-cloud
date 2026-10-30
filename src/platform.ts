@@ -56,6 +56,7 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   private discoveryRetryTimeout: NodeJS.Timeout | undefined;
   private discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
   private discoveryAttempts = 0;
+  private lastDiscoveryError: string | undefined;
   private lastSuccessfulUpdateAt: Date | undefined;
   private stalenessMonitor: NodeJS.Timeout | undefined;
   private stalenessWarnedAt = 0;
@@ -268,12 +269,43 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       if (error instanceof Error) {
         const message = `[API Syncing] Failed to get cloud devices from Daikin Cloud: ${error.message}`;
         this.log.error(message);
+        this.lastDiscoveryError = error.message;
 
         if (error.message.includes('invalid_grant')) {
           onInvalidGrantError();
         }
       }
       return [];
+    }
+  }
+
+  /**
+   * A rejected token set looks the same whatever caused it: expired access token
+   * plus a refresh token the cloud no longer accepts (rotated, revoked, or the
+   * account was re-configured). Waiting will not fix that, so mobile-app mode
+   * logs in again with the credentials from the config.
+   */
+  private isAuthFailure(message: string | undefined): boolean {
+    if (!message) {
+      return false;
+    }
+    return /unauthorized|not authenticated|invalid_grant|refresh token|invalid_client/i.test(message);
+  }
+
+  private async reauthenticate(controller: DaikinCloudController): Promise<boolean> {
+    if (this.authMode !== 'mobile_app') {
+      this.log.warn('[Auth] Daikin Cloud rejects the stored token and developer-portal mode cannot log in by itself. Re-authenticate via the Homebridge UI.');
+      return false;
+    }
+
+    try {
+      this.log.warn('[Auth] Stored token set is no longer accepted, logging in again with the configured credentials...');
+      await controller.authenticateMobile();
+      this.log.info('[Auth] Re-authenticated with Daikin Cloud');
+      return true;
+    } catch (error) {
+      this.log.error(`[Auth] Re-authentication failed: ${(error as Error).message}`);
+      return false;
     }
   }
 
@@ -287,7 +319,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
    * a Homebridge restart during such an outage is enough to land here, so retry
    * with backoff until discovery succeeds.
    */
-  private async startDeviceDiscovery(controller: DaikinCloudController, onInvalidGrantError: () => void): Promise<void> {
+  private async startDeviceDiscovery(
+    controller: DaikinCloudController,
+    onInvalidGrantError: () => void,
+    allowReauth = true,
+  ): Promise<void> {
+    this.lastDiscoveryError = undefined;
     const devices: DaikinCloudDevice[] = await this.discoverDevices(controller, onInvalidGrantError);
 
     if (devices.length > 0) {
@@ -307,7 +344,18 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    if (this.isShuttingDown || this.discoveryRetryTimeout) {
+    if (this.isShuttingDown) {
+      return;
+    }
+
+    // Retry immediately after a successful login; the backoff below is for an
+    // unreachable cloud, which credentials cannot fix.
+    if (allowReauth && this.isAuthFailure(this.lastDiscoveryError) && await this.reauthenticate(controller)) {
+      await this.startDeviceDiscovery(controller, onInvalidGrantError, false);
+      return;
+    }
+
+    if (this.discoveryRetryTimeout) {
       return;
     }
 
