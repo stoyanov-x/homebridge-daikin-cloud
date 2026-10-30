@@ -121,9 +121,21 @@ main() {
     log_info "Found container: $container"
     
     # Step 5: Install the plugin inside the container
+    # --ignore-scripts: installing this tarball otherwise re-runs the lifecycle
+    # scripts of every installed dependency, and ffmpeg-for-homebridge downloads a
+    # binary on postinstall. When that download fails npm rolls the whole tree
+    # back, silently leaving the previous version in place.
     log_info "Installing plugin in container..."
-    ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "sudo docker exec $container npm --prefix /var/lib/homebridge install $CONTAINER_MOUNT_PATH/$tgz_basename"
-    
+    ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "sudo docker exec $container npm --prefix /var/lib/homebridge install --ignore-scripts --no-audit --no-fund $CONTAINER_MOUNT_PATH/$tgz_basename"
+
+    # Step 5b: Never claim success without checking what actually landed
+    log_info "Verifying installed version..."
+    local installed=$(ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "sudo docker exec $container node -e \"console.log(require('/homebridge/node_modules/@mp-consulting/homebridge-daikin-cloud/package.json').version)\"" | tr -d '\r')
+    log_info "Installed version: $installed"
+    if [[ "$tgz_basename" != *"$installed"* ]]; then
+        log_error "Container still has version '$installed', expected it to come from $tgz_basename"
+        exit 1
+    fi
     # Step 6: Restart the container
     log_info "Restarting container..."
     ssh $SSH_OPTS "$REMOTE_USER@$REMOTE_HOST" "sudo docker restart $container"

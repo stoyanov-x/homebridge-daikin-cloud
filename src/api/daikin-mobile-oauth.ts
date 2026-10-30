@@ -14,6 +14,22 @@ import type { TokenSet, MobileClientConfig } from './daikin-types';
 import { DAIKIN_MOBILE_CONFIG } from './daikin-types';
 import { HTTP_REQUEST_TIMEOUT_MS } from '../constants';
 import { loadTokenFromFile, saveTokenToFile, deleteTokenFile } from './token-storage';
+import { cachedLookup } from './dns-cache';
+
+/** Refresh this many seconds before the access token expires (and treat it as expired inside this window) */
+const TOKEN_REFRESH_BUFFER_SECONDS = 60;
+
+/**
+ * Proactive refresh timers, kept off the instance on purpose.
+ *
+ * The accessory context holds the device, which holds the api client, which
+ * holds this object - and Homebridge serialises platform accessories to
+ * cachedAccessories on every change. A Node Timeout carries _idlePrev/_idleNext
+ * links, so an enumerable timer property makes that JSON circular and Homebridge
+ * refuses to save the cache at all ("accessories will not persist between
+ * restarts").
+ */
+const refreshTimers = new WeakMap<object, NodeJS.Timeout>();
 
 interface PKCEPair {
     verifier: string;
@@ -135,11 +151,11 @@ export class DaikinMobileOAuth {
       throw new Error('Not authenticated. Please authenticate first.');
     }
 
-    // Check if token is expired or about to expire (10 second buffer)
+    // Check if token is expired or about to expire (1 minute buffer)
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = this.tokenSet.expires_at || 0;
 
-    if (expiresAt < now + 10) {
+    if (expiresAt < now + TOKEN_REFRESH_BUFFER_SECONDS) {
       if (!this.tokenSet.refresh_token) {
         throw new Error('Token expired and no refresh token available. Please re-authenticate.');
       }
@@ -147,6 +163,52 @@ export class DaikinMobileOAuth {
     }
 
     return this.tokenSet!.access_token;
+  }
+
+  /**
+   * Refresh ahead of expiry instead of waiting for a request to fail.
+   *
+   * Lazy refresh only works if something happens to call the API before the
+   * token dies. With the WebSocket carrying updates, polling can be an hour
+   * apart, and the first write after expiry then pays for a refresh on a
+   * request the user is waiting on. The timer is unref'd so it never keeps the
+   * process alive.
+   */
+  private scheduleProactiveRefresh(tokenSet: TokenSet): void {
+    this.clearRefreshTimer();
+
+    if (!tokenSet.refresh_token) {
+      return;
+    }
+
+    // Measure from expires_at, not expires_in: a token loaded from disk at
+    // startup was issued at some earlier point, and expires_in alone would
+    // schedule the refresh after it has already expired.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const remainingSeconds = tokenSet.expires_at
+      ? tokenSet.expires_at - nowSeconds
+      : (tokenSet.expires_in || 0);
+
+    const delayMs = Math.max(0, remainingSeconds - TOKEN_REFRESH_BUFFER_SECONDS) * 1000;
+    const timer = setTimeout(() => {
+      refreshTimers.delete(this);
+      this.onLog?.(`[Auth] Refreshing access token ${TOKEN_REFRESH_BUFFER_SECONDS}s before it expires`);
+      this.refreshToken().catch((error: Error) => {
+        // Not fatal: getAccessToken still refreshes on demand, and the platform
+        // retries discovery if the token turns out to be unusable.
+        this.onLog?.(`[Auth] Proactive refresh failed: ${error.message}`);
+      });
+    }, delayMs);
+    timer.unref?.();
+    refreshTimers.set(this, timer);
+  }
+
+  private clearRefreshTimer(): void {
+    const timer = refreshTimers.get(this);
+    if (timer) {
+      clearTimeout(timer);
+      refreshTimers.delete(this);
+    }
   }
 
   /**
@@ -177,6 +239,7 @@ export class DaikinMobileOAuth {
      * Clear stored tokens
      */
   clearTokens(): void {
+    this.clearRefreshTimer();
     this.deleteFile();
     this.tokenSet = null;
   }
@@ -483,6 +546,7 @@ export class DaikinMobileOAuth {
 
     this.tokenSet = tokenSet;
     this.saveToFile();
+    this.scheduleProactiveRefresh(tokenSet);
 
     if (this.onTokenUpdate) {
       this.onTokenUpdate(tokenSet);
@@ -492,6 +556,12 @@ export class DaikinMobileOAuth {
   private loadFromFile(): void {
     try {
       this.tokenSet = loadTokenFromFile(this.config.tokenFilePath);
+      // A token restored at startup is just as real as one we fetched, and it is
+      // the common case after a restart: without this the proactive refresh would
+      // only ever be armed by a login that happened in this process.
+      if (this.tokenSet?.access_token) {
+        this.scheduleProactiveRefresh(this.tokenSet);
+      }
     } catch (error) {
       if (this.onError) {
         this.onError(new Error('Failed to load token file: ' + (error as Error).message));
@@ -531,6 +601,7 @@ export class DaikinMobileOAuth {
         port: 443,
         path: urlObj.pathname + urlObj.search,
         method: options.method,
+        lookup: cachedLookup,
         headers: {
           ...options.headers,
           ...(postData ? { 'Content-Length': Buffer.byteLength(postData).toString() } : {}),

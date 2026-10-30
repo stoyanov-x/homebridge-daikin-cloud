@@ -13,6 +13,7 @@ import type {
   OAuthProvider,
   TokenSet,
   WebSocketDeviceUpdate,
+  WebSocketGroupUpdate,
 } from './daikin-types';
 import { DaikinOAuth } from './daikin-oauth';
 import { DaikinMobileOAuth } from './daikin-mobile-oauth';
@@ -116,6 +117,14 @@ export class DaikinCloudController extends EventEmitter {
 
     this.websocket.on('device_update', (update: WebSocketDeviceUpdate) => {
       this.handleWebSocketDeviceUpdate(update);
+    });
+
+    // Group updates carry no device id, and this plugin has no group-to-device
+    // map, so they cannot be applied to a characteristic directly. Forward them
+    // so the platform can at least refresh (grouped equipment changes would
+    // otherwise wait for the next poll).
+    this.websocket.on('group_update', (update: WebSocketGroupUpdate) => {
+      this.emit('websocket_group_update', update);
     });
 
     this.websocket.on('error', (error: Error) => {

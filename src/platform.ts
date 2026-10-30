@@ -8,16 +8,40 @@ import { StringUtils } from './utils/strings';
 
 import fs from 'node:fs';
 import type { DaikinCloudDevice, DaikinControllerConfig } from './api';
-import { DaikinCloudRepo, DaikinCloudController } from './api';
+import { DaikinCloudRepo, DaikinCloudController, DAIKIN_MOBILE_CONFIG, DAIKIN_OIDC_CONFIG } from './api';
 import { UpdateMapper } from './utils/update-mapper';
 import type { PluginConfig } from './config/config-manager';
 import { ConfigManager } from './config/config-manager';
 import {
   ONE_MINUTE_MS,
+  ONE_HOUR_MS,
   DEFAULT_UPDATE_INTERVAL_MINUTES,
   DEFAULT_FORCE_UPDATE_DELAY_MS,
+  WEBSOCKET_FALLBACK_POLL_INTERVAL_MS,
+  DISCOVERY_RETRY_INITIAL_DELAY_MS,
+  DISCOVERY_RETRY_MAX_DELAY_MS,
   RATE_LIMIT_WARNING_THRESHOLD,
 } from './constants';
+
+/** "9h 12m" — for staleness messages, where an exact millisecond count is noise. */
+function formatDuration(ms: number): string {
+  const minutes = Math.floor(ms / ONE_MINUTE_MS);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) {
+    return `${days}d ${hours % 24}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  return `${minutes}m`;
+}
+
+/**
+ * Characteristics that stream in continuously and are not worth an info line:
+ * every gateway pushes room and outdoor temperature on its own schedule.
+ */
+const QUIET_CHARACTERISTICS = new Set(['sensoryData', 'consumptionData']);
 
 export type DaikinCloudAccessoryContext = {
     device: DaikinCloudDevice;
@@ -35,10 +59,19 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   public readonly updateIntervalDelay: number;
   private updateInterval: NodeJS.Timeout | undefined;
   private forceUpdateTimeout: NodeJS.Timeout | undefined;
+  private discoveryRetryTimeout: NodeJS.Timeout | undefined;
+  private discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+  private discoveryAttempts = 0;
+  private lastDiscoveryError: string | undefined;
+  private lastSuccessfulUpdateAt: Date | undefined;
+  private stalenessMonitor: NodeJS.Timeout | undefined;
+  private stalenessWarnedAt = 0;
+  private isShuttingDown = false;
   private readonly accessoryFactory: AccessoryFactory;
   private readonly updateMapper: UpdateMapper;
   private readonly authMode: 'developer_portal' | 'mobile_app';
   private readonly deviceListeners = new Map<string, () => void>();
+  private websocketConnected = false;
 
   constructor(
         public readonly log: Logger,
@@ -119,9 +152,22 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
     this.controller = new DaikinCloudController(daikinCloudControllerConfig);
 
+    // Spelled out because the first thing worth checking in an outage is whether
+    // the endpoints the plugin uses answer at all.
+    const apiBaseUrl = this.authMode === 'mobile_app' ? DAIKIN_MOBILE_CONFIG.apiBaseUrl : DAIKIN_OIDC_CONFIG.apiBaseUrl;
+    const websocketUrl = this.authMode === 'mobile_app' ? DAIKIN_MOBILE_CONFIG.websocketUrl : undefined;
+    this.log.info(`[Config] Daikin Cloud API: ${apiBaseUrl}${websocketUrl ? ` (WebSocket: ${websocketUrl})` : ''}`);
+
     this.api.on('didFinishLaunching', async () => {
       if (!this.controller) {
         return;
+      }
+
+      const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
+
+      const tokenExpiration = this.controller.getTokenExpiration?.();
+      if (tokenExpiration) {
+        this.log.info(`[Auth] Access token valid until ${tokenExpiration.toISOString()}`);
       }
 
       // Handle authentication based on mode
@@ -133,7 +179,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
             await this.controller.authenticateMobile();
             this.log.info('[Auth] Authentication successful!');
           } catch (error) {
+            // The login itself can fail for reasons that pass: the endpoint being
+            // unreachable, a 30s request timeout, throttling. Enter the discovery
+            // loop anyway - it retries, and it re-authenticates when it can - rather
+            // than leaving the plugin inert until someone restarts Homebridge.
             this.log.error(`[Auth] Authentication failed: ${(error as Error).message}`);
+            await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
             this.log.info('--------------- End Daikin info for debugging reasons --------------------');
             return;
           }
@@ -165,14 +216,23 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
       // WebSocket event handlers
       this.controller.on('websocket_connected', () => {
+        this.websocketConnected = true;
         this.log.info('[WebSocket] Connected - receiving real-time updates');
+        // Restore the normal polling interval now that real-time updates are flowing
+        this.restartUpdateDevicesInterval();
       });
 
       this.controller.on('websocket_disconnected', (info?: { reconnecting: boolean }) => {
+        this.websocketConnected = false;
         if (info?.reconnecting) {
           this.log.debug('[WebSocket] Disconnected, attempting to reconnect...');
+          // Shorten the polling interval while WebSocket is down so the plugin
+          // doesn't miss state changes for the full configured interval (default
+          // 15 min). Once WebSocket reconnects, websocket_connected restores it.
+          this.restartUpdateDevicesInterval(WEBSOCKET_FALLBACK_POLL_INTERVAL_MS);
         } else {
           this.log.info('[WebSocket] Disconnected');
+          this.restartUpdateDevicesInterval(WEBSOCKET_FALLBACK_POLL_INTERVAL_MS);
         }
       });
 
@@ -181,18 +241,15 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
         this.handleWebSocketDeviceUpdate(update);
       });
 
-      const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
-      const devices: DaikinCloudDevice[] = await this.discoverDevices(this.controller, onInvalidGrantError);
+      // Group events cannot be mapped to a single accessory (no group-to-device
+      // map is fetched), so use them as a hint that something changed and let the
+      // debounced force-update reconcile. Cheap: rapid bursts collapse into one poll.
+      this.controller.on('websocket_group_update', (update) => {
+        this.log.debug(`[WebSocket] Group update: ${update.groupId} - ${update.characteristicName} (refreshing devices)`);
+        this.forceUpdateDevices();
+      });
 
-      if (devices.length > 0) {
-        this.createDevices(devices);
-        this.startUpdateDevicesInterval();
-
-        // Enable WebSocket for real-time updates (unless explicitly disabled)
-        if (this.config.enableWebSocket !== false) {
-          await this.enableWebSocket();
-        }
-      }
+      await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
 
       this.log.info('--------------- End Daikin info for debugging reasons --------------------');
     });
@@ -200,8 +257,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     // Shutdown handler: clean up timers, WebSocket, and device listeners on platform shutdown
     this.api.on('shutdown', () => {
       this.log.debug('[Platform] Shutting down, cleaning up resources...');
+      this.isShuttingDown = true;
       clearInterval(this.updateInterval);
+      clearInterval(this.stalenessMonitor);
+      this.stalenessMonitor = undefined;
       clearTimeout(this.forceUpdateTimeout);
+      clearTimeout(this.discoveryRetryTimeout);
       this.controller?.disableWebSocket();
       for (const [uuid, listener] of this.deviceListeners) {
         const accessory = this.accessories.find(a => a.UUID === uuid);
@@ -225,6 +286,7 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       if (error instanceof Error) {
         const message = `[API Syncing] Failed to get cloud devices from Daikin Cloud: ${error.message}`;
         this.log.error(message);
+        this.lastDiscoveryError = error.message;
 
         if (error.message.includes('invalid_grant')) {
           onInvalidGrantError();
@@ -232,6 +294,103 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       }
       return [];
     }
+  }
+
+  /**
+   * A rejected token set looks the same whatever caused it: expired access token
+   * plus a refresh token the cloud no longer accepts (rotated, revoked, or the
+   * account was re-configured). Waiting will not fix that, so mobile-app mode
+   * logs in again with the credentials from the config.
+   */
+  private isAuthFailure(message: string | undefined): boolean {
+    if (!message) {
+      return false;
+    }
+    return /unauthorized|not authenticated|invalid_grant|refresh token|invalid_client/i.test(message);
+  }
+
+  private async reauthenticate(controller: DaikinCloudController): Promise<boolean> {
+    if (this.authMode !== 'mobile_app') {
+      this.log.warn('[Auth] Daikin Cloud rejects the stored token and developer-portal mode cannot log in by itself. Re-authenticate via the Homebridge UI.');
+      return false;
+    }
+
+    try {
+      this.log.warn('[Auth] Stored token set is no longer accepted, logging in again with the configured credentials...');
+      await controller.authenticateMobile();
+      this.log.info('[Auth] Re-authenticated with Daikin Cloud');
+      return true;
+    } catch (error) {
+      this.log.error(`[Auth] Re-authentication failed: ${(error as Error).message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Fetch devices, then start polling and the WebSocket once they are known.
+   *
+   * Discovery is the one call the plugin cannot recover from on its own: when it
+   * fails, no accessory is bound to a live device, no poll timer is scheduled
+   * and the WebSocket is never enabled, so HomeKit keeps reporting the values
+   * persisted at the previous shutdown. Daikin's cloud does go unreachable, and
+   * a Homebridge restart during such an outage is enough to land here, so retry
+   * with backoff until discovery succeeds.
+   */
+  private async startDeviceDiscovery(
+    controller: DaikinCloudController,
+    onInvalidGrantError: () => void,
+    allowReauth = true,
+  ): Promise<void> {
+    this.lastDiscoveryError = undefined;
+    const devices: DaikinCloudDevice[] = await this.discoverDevices(controller, onInvalidGrantError);
+
+    if (devices.length > 0) {
+      if (this.discoveryAttempts > 0) {
+        this.log.info(`[API Syncing] Device discovery recovered after ${this.discoveryAttempts} failed attempt(s)`);
+        this.discoveryAttempts = 0;
+      }
+      this.discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+      this.lastSuccessfulUpdateAt = new Date();
+      this.createDevices(devices);
+      this.startUpdateDevicesInterval();
+
+      // Enable WebSocket for real-time updates (unless explicitly disabled)
+      if (this.config.enableWebSocket !== false) {
+        await this.enableWebSocket();
+      }
+      return;
+    }
+
+    if (this.isShuttingDown) {
+      return;
+    }
+
+    // Retry immediately after a successful login; the backoff below is for an
+    // unreachable cloud, which credentials cannot fix.
+    if (allowReauth && this.isAuthFailure(this.lastDiscoveryError) && await this.reauthenticate(controller)) {
+      await this.startDeviceDiscovery(controller, onInvalidGrantError, false);
+      return;
+    }
+
+    if (this.discoveryRetryTimeout) {
+      return;
+    }
+
+    this.discoveryAttempts++;
+    if (this.discoveryAttempts === 1) {
+      // Say what the user will see, not just that a call failed: the accessories
+      // stay published with the characteristic values from the last shutdown.
+      this.log.warn('[API Syncing] No devices discovered: HomeKit will keep showing the state cached at the last shutdown until discovery succeeds');
+    }
+
+    const delay = this.discoveryRetryDelay;
+    this.discoveryRetryDelay = Math.min(delay * 2, DISCOVERY_RETRY_MAX_DELAY_MS);
+    this.log.warn(`[API Syncing] No devices discovered, retrying in ${Math.round(delay / ONE_MINUTE_MS)} minute(s)`);
+
+    this.discoveryRetryTimeout = setTimeout(() => {
+      this.discoveryRetryTimeout = undefined;
+      void this.startDeviceDiscovery(controller, onInvalidGrantError);
+    }, delay);
   }
 
   private createDevices(devices: DaikinCloudDevice[]) {
@@ -306,9 +465,51 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     }
     try {
       await this.controller.updateAllDeviceData();
+      this.lastSuccessfulUpdateAt = new Date();
+      this.stalenessWarnedAt = 0;
     } catch (error) {
-      this.log.error(`[API Syncing] Failed to update devices data: ${JSON.stringify(error)}`);
+      // JSON.stringify(error) is just "{}" - an Error carries nothing enumerable.
+      this.log.error(`[API Syncing] Failed to update devices data: ${(error as Error).message}`);
     }
+  }
+
+  /**
+   * Warn when HomeKit's view of the devices has gone stale.
+   *
+   * A cloud outage otherwise looks like a working plugin showing the wrong
+   * values: nothing throws on the HomeKit side, requests just keep failing. The
+   * warning repeats once an hour so it survives a log being cleared.
+   */
+  private startStalenessMonitor(): void {
+    if (this.stalenessMonitor) {
+      return;
+    }
+
+    const staleAfterMs = Math.max(this.updateIntervalDelay * 3, 15 * ONE_MINUTE_MS);
+    const checkEveryMs = Math.min(this.updateIntervalDelay, 5 * ONE_MINUTE_MS);
+
+    this.stalenessMonitor = setInterval(() => {
+      const lastSuccess = this.lastSuccessfulUpdateAt;
+      if (this.isShuttingDown || !lastSuccess) {
+        return;
+      }
+
+      const staleForMs = Date.now() - lastSuccess.getTime();
+      if (staleForMs < staleAfterMs) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - this.stalenessWarnedAt < ONE_HOUR_MS) {
+        return;
+      }
+
+      this.stalenessWarnedAt = now;
+      this.log.warn(
+        `[API Syncing] No successful update for ${formatDuration(staleForMs)}: `
+        + `HomeKit is still showing the state from ${lastSuccess.toISOString()}`,
+      );
+    }, checkEveryMs);
   }
 
   forceUpdateDevices(delay: number = Math.max(0, this.config.forceUpdateDelay || DEFAULT_FORCE_UPDATE_DELAY_MS)) {
@@ -337,15 +538,26 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     }, delay);
   }
 
-  private startUpdateDevicesInterval() {
-    this.log.debug(`[API Syncing] (Re)starting update devices interval every ${this.updateIntervalDelay / ONE_MINUTE_MS} minutes`);
+  private startUpdateDevicesInterval(intervalMs?: number) {
+    const delay = intervalMs ?? this.updateIntervalDelay;
+    this.log.debug(`[API Syncing] (Re)starting update devices interval every ${delay / ONE_MINUTE_MS} minutes`);
+    this.startStalenessMonitor();
     this.updateInterval = setInterval(async () => {
       try {
         await this.updateDevices();
       } catch (error) {
         this.log.error(`[API Syncing] Periodic update failed: ${(error as Error).message}`);
       }
-    }, this.updateIntervalDelay);
+    }, delay);
+  }
+
+  /**
+   * Restart the periodic polling interval, optionally with a custom delay.
+   * Clears the existing interval before starting a new one.
+   */
+  private restartUpdateDevicesInterval(intervalMs?: number): void {
+    clearInterval(this.updateInterval);
+    this.startUpdateDevicesInterval(intervalMs);
   }
 
   private async enableWebSocket() {
@@ -409,8 +621,23 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     // Use the UpdateMapper to apply the update
     const result = this.updateMapper.applyUpdate(accessory, update);
 
-    if (result.success) {
-      this.log.debug(`[WebSocket] Updated ${result.updated.join(', ')}`);
+    if (!result.success || result.updated.length === 0) {
+      return;
+    }
+
+    // State changes are logged at info level: otherwise a push that reaches
+    // HomeKit is indistinguishable from one that never arrived, because the only
+    // other trace is debug output. Room/outdoor temperature arrives for every
+    // device every couple of minutes and would drown those lines, so it stays at
+    // debug. Only emitted when a characteristic actually changed.
+    const value = update.data?.value;
+    const shown = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    const line = `[WebSocket] ${accessory.displayName}: ${update.characteristicName} -> ${shown} (${result.updated.join(', ')})`;
+
+    if (QUIET_CHARACTERISTICS.has(update.characteristicName)) {
+      this.log.debug(line);
+    } else {
+      this.log.info(line);
     }
   }
 }

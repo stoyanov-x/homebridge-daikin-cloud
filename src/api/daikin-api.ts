@@ -9,6 +9,7 @@ import { z } from 'zod';
 import type { RateLimitStatus, GatewayDevice, OAuthProvider } from './daikin-types';
 import { DAIKIN_OIDC_CONFIG } from './daikin-types';
 import { GatewayDeviceSchema } from './daikin-schemas';
+import { cachedLookup } from './dns-cache';
 import {
   HTTP_STATUS,
   DEFAULT_RETRY_AFTER_SECONDS,
@@ -40,6 +41,22 @@ export class ApiTimeoutError extends Error {
     super(message);
     this.name = 'ApiTimeoutError';
   }
+}
+
+/**
+ * Host and path of a request, for error messages. A hung CDN and a dead device
+ * gateway look identical in a stack trace, but the host tells them apart.
+ */
+function describeEndpoint(urlObj: URL): string {
+  return urlObj.pathname === '/' ? urlObj.hostname : `${urlObj.hostname}${urlObj.pathname}`;
+}
+
+function describeError(error: Error, urlObj: URL): Error {
+  // The timeout handler already named the endpoint; don't name it twice.
+  if (error.message.includes(describeEndpoint(urlObj))) {
+    return error;
+  }
+  return new Error(`${error.message} (${describeEndpoint(urlObj)})`);
 }
 
 export class DaikinApi {
@@ -108,12 +125,12 @@ export class DaikinApi {
   ): Promise<{ statusCode: number; body: string; headers: Record<string, string | string[] | undefined> }> {
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
-
       const options: https.RequestOptions = {
         hostname: urlObj.hostname,
         port: 443,
-        path: urlObj.pathname + urlObj.search,
+        path: urlObj.pathname,
         method: 'GET',
+        lookup: cachedLookup,
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Accept': 'application/json',
@@ -131,10 +148,10 @@ export class DaikinApi {
       });
 
       req.setTimeout(HTTP_REQUEST_TIMEOUT_MS, () => {
-        req.destroy(new Error(`Request timed out after ${HTTP_REQUEST_TIMEOUT_MS}ms`));
+        req.destroy(new Error(`Request timed out after ${HTTP_REQUEST_TIMEOUT_MS}ms (${describeEndpoint(urlObj)})`));
       });
 
-      req.on('error', reject);
+      req.on('error', (error) => reject(describeError(error, urlObj)));
       req.end();
     });
   }
@@ -400,6 +417,7 @@ export class DaikinApi {
         port: 443,
         path: urlObj.pathname + urlObj.search,
         method,
+        lookup: cachedLookup,
         headers: {
           'Authorization': `Bearer ${accessToken}`,
           'Accept': 'application/json',
@@ -421,10 +439,10 @@ export class DaikinApi {
       });
 
       req.setTimeout(HTTP_REQUEST_TIMEOUT_MS, () => {
-        req.destroy(new Error(`Request timed out after ${HTTP_REQUEST_TIMEOUT_MS}ms`));
+        req.destroy(new Error(`Request timed out after ${HTTP_REQUEST_TIMEOUT_MS}ms (${describeEndpoint(urlObj)})`));
       });
 
-      req.on('error', reject);
+      req.on('error', (error) => reject(describeError(error, urlObj)));
 
       if (bodyStr) {
         req.write(bodyStr);

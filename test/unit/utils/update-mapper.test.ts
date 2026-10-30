@@ -100,6 +100,33 @@ describe('UpdateMapper', () => {
         );
       });
 
+      // Powering on only pushes onOffMode, so the state the tile renders has to
+      // come from here rather than from whatever ran last.
+      it('also sets the current and target state when turned on', () => {
+        const { accessory, mockService } = createMockAccessory('HeaterCooler', {
+          onOffMode: { value: 'on' },
+          operationMode: { value: 'heating' },
+        });
+        const update: DeviceUpdate = {
+          deviceId: 'device-1',
+          embeddedId: 'climateControl',
+          characteristicName: 'onOffMode',
+          data: { value: 'on' },
+        };
+
+        const result = mapper.applyUpdate(accessory, update);
+
+        expect(mockService.updateCharacteristic).toHaveBeenCalledWith(
+          CharacteristicMock.TargetHeaterCoolerState,
+          CharacteristicMock.TargetHeaterCoolerState.HEAT,
+        );
+        expect(mockService.updateCharacteristic).toHaveBeenCalledWith(
+          CharacteristicMock.CurrentHeaterCoolerState,
+          CharacteristicMock.CurrentHeaterCoolerState.HEATING,
+        );
+        expect(result.updated).toContain('CurrentHeaterCoolerState=2');
+      });
+
       it('should update HeaterCooler Active to INACTIVE and state when turned off', () => {
         const { accessory, mockService } = createMockAccessory('HeaterCooler');
         const update: DeviceUpdate = {

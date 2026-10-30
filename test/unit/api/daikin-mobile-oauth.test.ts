@@ -350,3 +350,126 @@ describe('DaikinMobileOAuth', () => {
     });
   });
 });
+
+describe('proactive token refresh', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const adoptToken = (oauth: DaikinMobileOAuth, expiresIn: number) => {
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'access',
+      refresh_token: 'refresh',
+      expires_in: expiresIn,
+    });
+  };
+
+  it('refreshes a minute before the token expires', async () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    adoptToken(oauth, 3600);
+    await vi.advanceTimersByTimeAsync(3530 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(20 * 1000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('treats a token inside the one minute buffer as expired', async () => {
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockImplementation(async () => {
+      (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+        access_token: 'fresh',
+        refresh_token: 'refresh',
+        expires_in: 3600,
+      });
+      return { access_token: 'fresh' } as never;
+    });
+
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'stale',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 30,
+    });
+
+    await expect(oauth.getAccessToken()).resolves.toBe('fresh');
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refresh a token that has no refresh token', async () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({} as never);
+
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({ access_token: 'access', expires_in: 3600 });
+    await vi.advanceTimersByTimeAsync(4000 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});
+
+describe('refresh scheduling for a token restored from disk', () => {
+  it('refreshes relative to expires_at, not a fresh lifetime', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-30T09:00:00Z'));
+    const { loadTokenFromFile } = await import('../../../src/api/token-storage');
+    (loadTokenFromFile as unknown as { mockReturnValue: (v: unknown) => void }).mockReturnValue({
+      access_token: 'from-disk',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 1800, // half its life already gone
+    });
+
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    await vi.advanceTimersByTimeAsync(1700 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(40 * 1000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+
+  it('refreshes immediately when the restored token is already inside the buffer', async () => {
+    vi.useFakeTimers();
+    const { loadTokenFromFile } = await import('../../../src/api/token-storage');
+    (loadTokenFromFile as unknown as { mockReturnValue: (v: unknown) => void }).mockReturnValue({
+      access_token: 'from-disk',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 20,
+    });
+
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    await vi.advanceTimersByTimeAsync(10);
+    expect(refresh).toHaveBeenCalledTimes(1);
+
+    vi.useRealTimers();
+  });
+});
+
+describe('serialisation safety', () => {
+  // Homebridge writes platform accessories to cachedAccessories on every change,
+  // and the accessory context reaches this object via device -> api -> oauth.
+  // An enumerable Node Timeout there threw "Converting circular structure to JSON"
+  // and stopped the cache from being written at all.
+  it('stays JSON-serialisable while a refresh timer is armed', () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'access',
+      refresh_token: 'refresh',
+      expires_in: 3600,
+    });
+
+    const accessory = { context: { device: { getApi: () => ({ oauth }) } } };
+    expect(() => JSON.stringify(accessory)).not.toThrow();
+
+    vi.useRealTimers();
+  });
+});
