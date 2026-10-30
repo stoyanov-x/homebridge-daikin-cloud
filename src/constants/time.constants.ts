@@ -33,4 +33,4 @@ export const WEBSOCKET_FALLBACK_POLL_INTERVAL_MS = ONE_MINUTE_MS * 2;
 export const DISCOVERY_RETRY_INITIAL_DELAY_MS = ONE_MINUTE_MS;
 
 /** Cap for the exponential backoff between discovery attempts */
-export const DISCOVERY_RETRY_MAX_DELAY_MS = ONE_MINUTE_MS * 15;
+export const DISCOVERY_RETRY_MAX_DELAY_MS = ONE_MINUTE_MS * 5;

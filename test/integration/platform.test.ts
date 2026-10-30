@@ -325,7 +325,7 @@ test('backs off until the discovery retry delay is capped', async () => {
   api.signalFinished();
   await vi.advanceTimersByTimeAsync(100);
 
-  // t=0 boot, then retries at t=1, 3, 7 and 15 minutes (1, 2, 4 and 8 minute gaps)
+  // t=0 boot, then retries at t=1, 3, 7 and every 5 minutes after that
   expect(getCloudDevices).toHaveBeenCalledTimes(1);
   await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 1);
   expect(getCloudDevices).toHaveBeenCalledTimes(2);
@@ -333,11 +333,13 @@ test('backs off until the discovery retry delay is capped', async () => {
   expect(getCloudDevices).toHaveBeenCalledTimes(3);
   await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 4);
   expect(getCloudDevices).toHaveBeenCalledTimes(4);
-  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 8);
-  expect(getCloudDevices).toHaveBeenCalledTimes(5);
 
-  // Capped at 15 minutes from here on
-  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 14);
+  // Capped at 5 minutes: 4 minutes is not enough
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 4);
+  expect(getCloudDevices).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 1);
+  expect(getCloudDevices).toHaveBeenCalledTimes(5);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 4);
   expect(getCloudDevices).toHaveBeenCalledTimes(5);
   await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 1);
   expect(getCloudDevices).toHaveBeenCalledTimes(6);
