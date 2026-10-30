@@ -157,6 +157,8 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
         return;
       }
 
+      const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
+
       // Handle authentication based on mode
       if (!this.controller.isAuthenticated()) {
         if (this.authMode === 'mobile_app') {
@@ -166,7 +168,12 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
             await this.controller.authenticateMobile();
             this.log.info('[Auth] Authentication successful!');
           } catch (error) {
+            // The login itself can fail for reasons that pass: the endpoint being
+            // unreachable, a 30s request timeout, throttling. Enter the discovery
+            // loop anyway - it retries, and it re-authenticates when it can - rather
+            // than leaving the plugin inert until someone restarts Homebridge.
             this.log.error(`[Auth] Authentication failed: ${(error as Error).message}`);
+            await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
             this.log.info('--------------- End Daikin info for debugging reasons --------------------');
             return;
           }
@@ -231,7 +238,6 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
         this.forceUpdateDevices();
       });
 
-      const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
       await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
 
       this.log.info('--------------- End Daikin info for debugging reasons --------------------');

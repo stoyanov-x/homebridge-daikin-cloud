@@ -439,3 +439,52 @@ test('logs in again when the stored token set is rejected, instead of retrying i
   expect(getCloudDevices).toHaveBeenCalledTimes(2);
   expect(registerPlatformAccessoriesSpy).toHaveBeenCalledWith('@mp-consulting/homebridge-daikin-cloud', 'DaikinCloud', expect.anything());
 });
+
+test('keeps retrying when the login itself fails at boot', async () => {
+  const mockDevice = {
+    getId: () => 'MOCK_ID',
+    getDescription: () => ({ deviceModel: 'Airco' }),
+    getData: () => 'MOCK_DATE',
+    desc: { managementPoints: [{ embeddedId: 'climateControl', managementPointType: 'climateControl' }] },
+  } as unknown as DaikinCloudDevice;
+
+  // No stored token, and every auth attempt times out (endpoint unreachable)
+  const getCloudDevices = vi.fn().mockRejectedValue(new Error('Not authenticated. Please authenticate first.'));
+  const authenticateMobile = vi.fn().mockRejectedValue(new Error('Mobile OAuth request timed out after 30000ms'));
+
+  MockDaikinCloudController.mockImplementation(function(this: any) {
+    this.getCloudDevices = getCloudDevices;
+    this.isAuthenticated = vi.fn().mockReturnValue(false);
+    this.on = vi.fn();
+    this.updateAllDeviceData = vi.fn().mockResolvedValue(undefined);
+    this.authenticateMobile = authenticateMobile;
+    this.disableWebSocket = vi.fn();
+  });
+
+  const api = new HomebridgeAPI();
+  const config = new MockPlatformConfig(true);
+  (config as any).authMode = 'mobile_app';
+  (config as any).daikinEmail = 'user@example.com';
+  (config as any).daikinPassword = 'secret';
+  const registerPlatformAccessoriesSpy = vi.spyOn(api, 'registerPlatformAccessories');
+  const platform = new DaikinCloudPlatform(new Logger(), config, api);
+  const warnSpy = vi.spyOn(platform.log, 'warn');
+
+  api.signalFinished();
+  await vi.advanceTimersByTimeAsync(100);
+
+  // The failed login must not end the story: it falls into the retry loop
+  expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('retrying in'));
+  expect(registerPlatformAccessoriesSpy).not.toHaveBeenCalled();
+  const attemptsAfterBoot = getCloudDevices.mock.calls.length;
+
+  // A minute later it tries again on its own
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS);
+  expect(getCloudDevices.mock.calls.length).toBeGreaterThan(attemptsAfterBoot);
+
+  // ...and when the cloud answers, the accessories get registered
+  getCloudDevices.mockResolvedValue([mockDevice]);
+  authenticateMobile.mockResolvedValue({ access_token: 'new' });
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 2);
+  expect(registerPlatformAccessoriesSpy).toHaveBeenCalledWith('@mp-consulting/homebridge-daikin-cloud', 'DaikinCloud', expect.anything());
+});
