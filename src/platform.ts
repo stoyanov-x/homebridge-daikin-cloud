@@ -17,6 +17,8 @@ import {
   DEFAULT_UPDATE_INTERVAL_MINUTES,
   DEFAULT_FORCE_UPDATE_DELAY_MS,
   WEBSOCKET_FALLBACK_POLL_INTERVAL_MS,
+  DISCOVERY_RETRY_INITIAL_DELAY_MS,
+  DISCOVERY_RETRY_MAX_DELAY_MS,
   RATE_LIMIT_WARNING_THRESHOLD,
 } from './constants';
 
@@ -36,6 +38,9 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
   public readonly updateIntervalDelay: number;
   private updateInterval: NodeJS.Timeout | undefined;
   private forceUpdateTimeout: NodeJS.Timeout | undefined;
+  private discoveryRetryTimeout: NodeJS.Timeout | undefined;
+  private discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+  private isShuttingDown = false;
   private readonly accessoryFactory: AccessoryFactory;
   private readonly updateMapper: UpdateMapper;
   private readonly authMode: 'developer_portal' | 'mobile_app';
@@ -193,17 +198,7 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       });
 
       const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
-      const devices: DaikinCloudDevice[] = await this.discoverDevices(this.controller, onInvalidGrantError);
-
-      if (devices.length > 0) {
-        this.createDevices(devices);
-        this.startUpdateDevicesInterval();
-
-        // Enable WebSocket for real-time updates (unless explicitly disabled)
-        if (this.config.enableWebSocket !== false) {
-          await this.enableWebSocket();
-        }
-      }
+      await this.startDeviceDiscovery(this.controller, onInvalidGrantError);
 
       this.log.info('--------------- End Daikin info for debugging reasons --------------------');
     });
@@ -211,8 +206,10 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     // Shutdown handler: clean up timers, WebSocket, and device listeners on platform shutdown
     this.api.on('shutdown', () => {
       this.log.debug('[Platform] Shutting down, cleaning up resources...');
+      this.isShuttingDown = true;
       clearInterval(this.updateInterval);
       clearTimeout(this.forceUpdateTimeout);
+      clearTimeout(this.discoveryRetryTimeout);
       this.controller?.disableWebSocket();
       for (const [uuid, listener] of this.deviceListeners) {
         const accessory = this.accessories.find(a => a.UUID === uuid);
@@ -243,6 +240,45 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       }
       return [];
     }
+  }
+
+  /**
+   * Fetch devices, then start polling and the WebSocket once they are known.
+   *
+   * Discovery is the one call the plugin cannot recover from on its own: when it
+   * fails, no accessory is bound to a live device, no poll timer is scheduled
+   * and the WebSocket is never enabled, so HomeKit keeps reporting the values
+   * persisted at the previous shutdown. Daikin's cloud does go unreachable, and
+   * a Homebridge restart during such an outage is enough to land here, so retry
+   * with backoff until discovery succeeds.
+   */
+  private async startDeviceDiscovery(controller: DaikinCloudController, onInvalidGrantError: () => void): Promise<void> {
+    const devices: DaikinCloudDevice[] = await this.discoverDevices(controller, onInvalidGrantError);
+
+    if (devices.length > 0) {
+      this.discoveryRetryDelay = DISCOVERY_RETRY_INITIAL_DELAY_MS;
+      this.createDevices(devices);
+      this.startUpdateDevicesInterval();
+
+      // Enable WebSocket for real-time updates (unless explicitly disabled)
+      if (this.config.enableWebSocket !== false) {
+        await this.enableWebSocket();
+      }
+      return;
+    }
+
+    if (this.isShuttingDown || this.discoveryRetryTimeout) {
+      return;
+    }
+
+    const delay = this.discoveryRetryDelay;
+    this.discoveryRetryDelay = Math.min(delay * 2, DISCOVERY_RETRY_MAX_DELAY_MS);
+    this.log.warn(`[API Syncing] No devices discovered, retrying in ${Math.round(delay / ONE_MINUTE_MS)} minute(s)`);
+
+    this.discoveryRetryTimeout = setTimeout(() => {
+      this.discoveryRetryTimeout = undefined;
+      void this.startDeviceDiscovery(controller, onInvalidGrantError);
+    }, delay);
   }
 
   private createDevices(devices: DaikinCloudDevice[]) {
@@ -318,7 +354,8 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
     try {
       await this.controller.updateAllDeviceData();
     } catch (error) {
-      this.log.error(`[API Syncing] Failed to update devices data: ${JSON.stringify(error)}`);
+      // JSON.stringify(error) is just "{}" - an Error carries nothing enumerable.
+      this.log.error(`[API Syncing] Failed to update devices data: ${(error as Error).message}`);
     }
   }
 

@@ -24,3 +24,13 @@ export const DEFAULT_FORCE_UPDATE_DELAY_MS = ONE_SECOND_MS * 60;
  * quickly when real-time updates aren't available.
  */
 export const WEBSOCKET_FALLBACK_POLL_INTERVAL_MS = ONE_MINUTE_MS * 2;
+
+/**
+ * Delay before the first retry when device discovery fails at startup.
+ * Discovery is what binds accessories to live devices, so the plugin keeps
+ * retrying until it succeeds instead of staying inert until the next restart.
+ */
+export const DISCOVERY_RETRY_INITIAL_DELAY_MS = ONE_MINUTE_MS;
+
+/** Cap for the exponential backoff between discovery attempts */
+export const DISCOVERY_RETRY_MAX_DELAY_MS = ONE_MINUTE_MS * 15;

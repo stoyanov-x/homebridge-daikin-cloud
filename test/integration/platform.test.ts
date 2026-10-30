@@ -6,6 +6,7 @@ import { DaikinCloudController } from '../../src/api';
 import { AirConditioningAccessory, AlthermaAccessory } from '../../src/accessories';
 import { HomebridgeAPI } from 'homebridge/lib/api.js';
 import { Logger } from 'homebridge/lib/logger.js';
+import { ONE_MINUTE_MS } from '../../src/constants';
 
 // Use vi.hoisted so the mock is available when vi.mock factory runs (hoisted)
 const { MockDaikinCloudController, MockAirConditioningAccessory, MockAlthermaAccessory } = vi.hoisted(() => ({
@@ -264,4 +265,82 @@ test('DaikinCloudPlatform with new Altherma accessory', async () => {
   expect(AlthermaAccessory).toHaveBeenCalled();
   expect(AirConditioningAccessory).not.toHaveBeenCalled();
   expect(registerPlatformAccessoriesSpy).toHaveBeenCalledWith('@mp-consulting/homebridge-daikin-cloud', 'DaikinCloud', expect.anything());
+});
+
+test('retries device discovery after a failed boot instead of staying inert', async () => {
+  const mockDevice = {
+    getId: () => 'MOCK_ID',
+    getDescription: () => ({ deviceModel: 'Airco' }),
+    getData: () => 'MOCK_DATE',
+    desc: { managementPoints: [{ embeddedId: 'climateControl', managementPointType: 'climateControl' }] },
+  } as unknown as DaikinCloudDevice;
+
+  // First attempt fails the way a Daikin Cloud outage looks: the request throws
+  const getCloudDevices = vi.fn()
+    .mockRejectedValueOnce(new Error('API request timed out after 30000ms'))
+    .mockResolvedValue([mockDevice]);
+
+  MockDaikinCloudController.mockImplementation(function(this: any) {
+    this.getCloudDevices = getCloudDevices;
+    this.isAuthenticated = vi.fn().mockReturnValue(true);
+    this.on = vi.fn();
+    this.updateAllDeviceData = vi.fn().mockResolvedValue(undefined);
+    this.disableWebSocket = vi.fn();
+  });
+
+  const api = new HomebridgeAPI();
+  const registerPlatformAccessoriesSpy = vi.spyOn(api, 'registerPlatformAccessories');
+
+  new DaikinCloudPlatform(new Logger(), new MockPlatformConfig(true), api);
+  api.signalFinished();
+  await vi.advanceTimersByTimeAsync(100);
+
+  expect(getCloudDevices).toHaveBeenCalledTimes(1);
+  expect(registerPlatformAccessoriesSpy).not.toHaveBeenCalled();
+
+  // The retry fires a minute later and the accessories get registered
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS);
+
+  expect(getCloudDevices).toHaveBeenCalledTimes(2);
+  expect(registerPlatformAccessoriesSpy).toHaveBeenCalledWith('@mp-consulting/homebridge-daikin-cloud', 'DaikinCloud', expect.anything());
+});
+
+test('backs off until the discovery retry delay is capped', async () => {
+  // Discovery keeps failing: attempts at 1, 3, 7 and then every 15 minutes
+  const getCloudDevices = vi.fn().mockRejectedValue(new Error('connect ETIMEDOUT'));
+
+  MockDaikinCloudController.mockImplementation(function(this: any) {
+    this.getCloudDevices = getCloudDevices;
+    this.isAuthenticated = vi.fn().mockReturnValue(true);
+    this.on = vi.fn();
+    this.updateAllDeviceData = vi.fn().mockResolvedValue(undefined);
+    this.disableWebSocket = vi.fn();
+  });
+
+  const api = new HomebridgeAPI();
+  new DaikinCloudPlatform(new Logger(), new MockPlatformConfig(true), api);
+  api.signalFinished();
+  await vi.advanceTimersByTimeAsync(100);
+
+  // t=0 boot, then retries at t=1, 3, 7 and 15 minutes (1, 2, 4 and 8 minute gaps)
+  expect(getCloudDevices).toHaveBeenCalledTimes(1);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 1);
+  expect(getCloudDevices).toHaveBeenCalledTimes(2);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 2);
+  expect(getCloudDevices).toHaveBeenCalledTimes(3);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 4);
+  expect(getCloudDevices).toHaveBeenCalledTimes(4);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 8);
+  expect(getCloudDevices).toHaveBeenCalledTimes(5);
+
+  // Capped at 15 minutes from here on
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 14);
+  expect(getCloudDevices).toHaveBeenCalledTimes(5);
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 1);
+  expect(getCloudDevices).toHaveBeenCalledTimes(6);
+
+  // Shutdown stops the retry loop
+  api.signalShutdown();
+  await vi.advanceTimersByTimeAsync(ONE_MINUTE_MS * 60);
+  expect(getCloudDevices).toHaveBeenCalledTimes(6);
 });
