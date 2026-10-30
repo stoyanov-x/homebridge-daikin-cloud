@@ -37,6 +37,12 @@ function formatDuration(ms: number): string {
   return `${minutes}m`;
 }
 
+/**
+ * Characteristics that stream in continuously and are not worth an info line:
+ * every gateway pushes room and outdoor temperature on its own schedule.
+ */
+const QUIET_CHARACTERISTICS = new Set(['sensoryData', 'consumptionData']);
+
 export type DaikinCloudAccessoryContext = {
     device: DaikinCloudDevice;
 };
@@ -619,12 +625,19 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    // At info level: otherwise a push that reaches HomeKit is indistinguishable
-    // from one that never arrived, because the only other trace is debug output.
-    // Only emitted when a characteristic actually changed, so repeated frames for
-    // the same value stay quiet.
+    // State changes are logged at info level: otherwise a push that reaches
+    // HomeKit is indistinguishable from one that never arrived, because the only
+    // other trace is debug output. Room/outdoor temperature arrives for every
+    // device every couple of minutes and would drown those lines, so it stays at
+    // debug. Only emitted when a characteristic actually changed.
     const value = update.data?.value;
     const shown = typeof value === 'object' ? JSON.stringify(value) : String(value);
-    this.log.info(`[WebSocket] ${accessory.displayName}: ${update.characteristicName} -> ${shown} (${result.updated.join(', ')})`);
+    const line = `[WebSocket] ${accessory.displayName}: ${update.characteristicName} -> ${shown} (${result.updated.join(', ')})`;
+
+    if (QUIET_CHARACTERISTICS.has(update.characteristicName)) {
+      this.log.debug(line);
+    } else {
+      this.log.info(line);
+    }
   }
 }
