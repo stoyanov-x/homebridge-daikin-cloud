@@ -15,6 +15,9 @@ import { DAIKIN_MOBILE_CONFIG } from './daikin-types';
 import { HTTP_REQUEST_TIMEOUT_MS } from '../constants';
 import { loadTokenFromFile, saveTokenToFile, deleteTokenFile } from './token-storage';
 
+/** Refresh this many seconds before the access token expires (and treat it as expired inside this window) */
+const TOKEN_REFRESH_BUFFER_SECONDS = 60;
+
 interface PKCEPair {
     verifier: string;
     challenge: string;
@@ -34,6 +37,7 @@ interface GigyaLoginResult {
 
 export class DaikinMobileOAuth {
   private tokenSet: TokenSet | null = null;
+  private refreshTimer: NodeJS.Timeout | null = null;
   private refreshPromise: Promise<TokenSet> | null = null;
   private cookies = '';
 
@@ -135,11 +139,11 @@ export class DaikinMobileOAuth {
       throw new Error('Not authenticated. Please authenticate first.');
     }
 
-    // Check if token is expired or about to expire (10 second buffer)
+    // Check if token is expired or about to expire (1 minute buffer)
     const now = Math.floor(Date.now() / 1000);
     const expiresAt = this.tokenSet.expires_at || 0;
 
-    if (expiresAt < now + 10) {
+    if (expiresAt < now + TOKEN_REFRESH_BUFFER_SECONDS) {
       if (!this.tokenSet.refresh_token) {
         throw new Error('Token expired and no refresh token available. Please re-authenticate.');
       }
@@ -147,6 +151,39 @@ export class DaikinMobileOAuth {
     }
 
     return this.tokenSet!.access_token;
+  }
+
+  /**
+   * Refresh ahead of expiry instead of waiting for a request to fail.
+   *
+   * Lazy refresh only works if something happens to call the API before the
+   * token dies. With the WebSocket carrying updates, polling can be an hour
+   * apart, and the first write after expiry then pays for a refresh on a
+   * request the user is waiting on. The timer is unref'd so it never keeps the
+   * process alive.
+   */
+  private scheduleProactiveRefresh(tokenSet: TokenSet): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+
+    const lifetimeSeconds = tokenSet.expires_in || (tokenSet.expires_at ? tokenSet.expires_at - Math.floor(Date.now() / 1000) : 0);
+    if (!tokenSet.refresh_token || lifetimeSeconds <= TOKEN_REFRESH_BUFFER_SECONDS * 2) {
+      return;
+    }
+
+    const delayMs = (lifetimeSeconds - TOKEN_REFRESH_BUFFER_SECONDS) * 1000;
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = null;
+      this.onLog?.(`[Auth] Refreshing access token ${TOKEN_REFRESH_BUFFER_SECONDS}s before it expires`);
+      this.refreshToken().catch((error: Error) => {
+        // Not fatal: getAccessToken still refreshes on demand, and the platform
+        // retries discovery if the token turns out to be unusable.
+        this.onLog?.(`[Auth] Proactive refresh failed: ${error.message}`);
+      });
+    }, delayMs);
+    this.refreshTimer.unref?.();
   }
 
   /**
@@ -177,6 +214,10 @@ export class DaikinMobileOAuth {
      * Clear stored tokens
      */
   clearTokens(): void {
+    if (this.refreshTimer) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+    }
     this.deleteFile();
     this.tokenSet = null;
   }
@@ -483,6 +524,7 @@ export class DaikinMobileOAuth {
 
     this.tokenSet = tokenSet;
     this.saveToFile();
+    this.scheduleProactiveRefresh(tokenSet);
 
     if (this.onTokenUpdate) {
       this.onTokenUpdate(tokenSet);

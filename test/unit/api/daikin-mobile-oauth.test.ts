@@ -350,3 +350,63 @@ describe('DaikinMobileOAuth', () => {
     });
   });
 });
+
+describe('proactive token refresh', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const adoptToken = (oauth: DaikinMobileOAuth, expiresIn: number) => {
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'access',
+      refresh_token: 'refresh',
+      expires_in: expiresIn,
+    });
+  };
+
+  it('refreshes a minute before the token expires', async () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({ access_token: 'new' } as never);
+
+    adoptToken(oauth, 3600);
+    await vi.advanceTimersByTimeAsync(3530 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(20 * 1000);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('treats a token inside the one minute buffer as expired', async () => {
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockImplementation(async () => {
+      (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+        access_token: 'fresh',
+        refresh_token: 'refresh',
+        expires_in: 3600,
+      });
+      return { access_token: 'fresh' } as never;
+    });
+
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({
+      access_token: 'stale',
+      refresh_token: 'refresh',
+      expires_at: Math.floor(Date.now() / 1000) + 30,
+    });
+
+    await expect(oauth.getAccessToken()).resolves.toBe('fresh');
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refresh a token that has no refresh token', async () => {
+    vi.useFakeTimers();
+    const oauth = new DaikinMobileOAuth(mockConfig);
+    const refresh = vi.spyOn(oauth, 'refreshToken').mockResolvedValue({} as never);
+
+    (oauth as unknown as { setTokenSet: (t: unknown) => void }).setTokenSet({ access_token: 'access', expires_in: 3600 });
+    await vi.advanceTimersByTimeAsync(4000 * 1000);
+    expect(refresh).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});

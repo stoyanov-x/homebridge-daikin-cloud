@@ -159,6 +159,11 @@ export class DaikinCloudPlatform implements DynamicPlatformPlugin {
 
       const onInvalidGrantError = () => this.onInvalidGrantError(tokenFilePath);
 
+      const tokenExpiration = this.controller.getTokenExpiration?.();
+      if (tokenExpiration) {
+        this.log.info(`[Auth] Access token valid until ${tokenExpiration.toISOString()}`);
+      }
+
       // Handle authentication based on mode
       if (!this.controller.isAuthenticated()) {
         if (this.authMode === 'mobile_app') {
